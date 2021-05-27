@@ -140,8 +140,8 @@ for line in input_stream:
 		if ref == '*':		# skip unmapped reads
 			break			# it's safe to quit at this point, right?
 
-		if pos > 1000000:	# for debugging purposes
-			continue
+		#if pos > 1000000:	# for debugging purposes
+		#	continue
 
 		if READ_MODE == 'CLR':
 			rnm = strip_polymerase_coords(splt[0])
