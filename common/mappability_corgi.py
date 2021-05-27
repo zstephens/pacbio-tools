@@ -1,7 +1,8 @@
 import os
+import sys
 import gzip
 import bisect
-import cPickle as pickle
+import pickle
 
 LARGE_NUMBER = (2**31) - 1
 
@@ -16,33 +17,33 @@ def exists_and_is_nonZero(fn):
 def condenseListOfRegions(l):
 	delList = [False]
 	prevR   = l[0]
-	for i in xrange(1,len(l)):
+	for i in range(1,len(l)):
 		if l[i][1] <= prevR[1]:
 			delList.append(True)
 		else:
 			delList.append(False)
 			prevR = l[i]
-	condensedInput = [l[i] for i in xrange(len(l)) if delList[i] == False]
+	condensedInput = [l[i] for i in range(len(l)) if delList[i] == False]
 	prevR = condensedInput[-1]
 	delList = [False]
-	for i in xrange(len(condensedInput)-2,-1,-1):
+	for i in range(len(condensedInput)-2,-1,-1):
 		if condensedInput[i][0] == prevR[0] and condensedInput[i][1] <= prevR[1]:
 			delList.append(True)
 		else:
 			delList.append(False)
 			prevR = condensedInput[i]
 	delList.reverse()
-	return [condensedInput[i] for i in xrange(len(condensedInput)) if delList[i] == False]
+	return [condensedInput[i] for i in range(len(condensedInput)) if delList[i] == False]
 
 # mappability track
 class MappabilityTrack:
 	def __init__(self, bedfile, bed_buffer=0, minRegionSize=1):
 
-		#print '-', bedfile
+		#print('-', bedfile)
 
 		readFromPickle = False
 		if exists_and_is_nonZero(bedfile+'.p'):
-			#print 'reading data from pickle...'
+			#print('reading data from pickle...')
 			self.all_tracks = pickle.load(open(bedfile+'.p','rb'))
 			readFromPickle = True
 
@@ -60,26 +61,27 @@ class MappabilityTrack:
 				##### skip certain refs
 				####if splt[0] in SKIP_XY:
 				####	continue
-				####print splt
+				####print(splt)
 				myChr = splt[0]
 				myPos = max([0,int(splt[1])-bed_buffer])
 				myEnd = int(splt[2])+bed_buffer
 				if myEnd <= myPos:
-					print 'skipping invalid bed region:', [myChr,myPos,myEnd]
+					print('skipping invalid bed region:', [myChr,myPos,myEnd])
 					continue
 				if myChr not in lines:
 					lines[myChr] = []
 				lines[myChr].append((myPos,myEnd))
 			f.close()
 			for k in sorted(lines.keys()):
-				print k, len(lines[k]), '-->',
+				sys.stdout.write(str(k) + ' ' + str(len(lines[k])) + ' --> ')
+				sys.stdout.flush()
 				s_dat = condenseListOfRegions(sorted(lines[k]))
-				print len(s_dat), '-->',
+				print(len(s_dat), '-->',)
 				can_I_stop_yet = False
 				i_start = len(s_dat)-2
 				while can_I_stop_yet == False:
 					can_I_stop_yet = True
-					for i in xrange(i_start+1,0,-1):
+					for i in range(i_start+1,0,-1):
 						if s_dat[i-1][1] >= s_dat[i][0]:
 							s_dat[i-1] = (s_dat[i-1][0],s_dat[i][1])
 							del s_dat[i]
@@ -87,7 +89,8 @@ class MappabilityTrack:
 							can_I_stop_yet = False
 							break
 				lines[k] = condenseListOfRegions(s_dat)
-				print len(lines[k])
+				sys.stdout.write(str(len(lines[k])) + '\n')
+				sys.stdout.flush()
 
 			# convert to a bisect-friendly list
 			self.all_tracks = {k:[-1] for k in lines.keys()}
@@ -96,21 +99,21 @@ class MappabilityTrack:
 				for dat in lines[k]:
 					[myChr,myPos,myEnd] = [k,dat[0],dat[1]]
 					if myPos < endSoFar[myChr]:
-						print 'skipping unsorted bed region:', [myChr,myPos,myEnd], endSoFar[myChr]
+						print('skipping unsorted bed region:', [myChr,myPos,myEnd], endSoFar[myChr])
 						continue
 					endSoFar[myChr] = myEnd
 					if myEnd-myPos < minRegionSize:
-						print 'skipping small bed region:', [myChr,myPos,myEnd]
+						print('skipping small bed region:', [myChr,myPos,myEnd])
 						continue
 					self.all_tracks[myChr].append(myPos)
 					self.all_tracks[myChr].append(myEnd)
 				# append something huge to prevent bisect from going past the length of the list
 				if LARGE_NUMBER <= self.all_tracks[k][-1]:
-					print "\nYour large number isn't large enough!\n"
+					print("\nYour large number isn't large enough!\n")
 					exit(1)
 				self.all_tracks[k].append(LARGE_NUMBER)
 
-			print 'saving bed data as pickle...'
+			print('saving bed data as pickle...')
 			pickle.dump(self.all_tracks,open(bedfile+'.p','wb'))
 
 	# return True if index is in bedfile region, False if outside
@@ -127,7 +130,7 @@ class MappabilityTrack:
 	def query_range(self, myChr, coord1, coord2, query_endPointInclusive=False):
 		count = 0
 		if myChr in self.all_tracks:
-			for i in xrange(coord1,coord2+1*query_endPointInclusive):
+			for i in range(coord1,coord2+1*query_endPointInclusive):
 				if self.query(myChr,i):
 					count += 1
 		return count
@@ -145,16 +148,16 @@ class MappabilityTrack:
 			if lb == ub and lb%2 == 1:
 				return 0
 
-			#print [coord1,coord2],(lb,ub)
+			#print([coord1,coord2],(lb,ub)
 			size_list   = [self.all_tracks[myChr][lb]-coord1]
 			in_out_list = [(lb%2 == 0)]
-			for i in xrange(lb+1,ub):
+			for i in range(lb+1,ub):
 				size_list.append(self.all_tracks[myChr][i]-self.all_tracks[myChr][i-1])
 				in_out_list.append((i%2 == 0))
 			size_list.append(coord2-self.all_tracks[myChr][ub-1])
 			in_out_list.append((ub%2 == 0))
 
-			for i in xrange(len(size_list)):
+			for i in range(len(size_list)):
 				if in_out_list[i]:
 					count += size_list[i] + 1*query_endPointInclusive
 
