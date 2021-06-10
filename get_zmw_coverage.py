@@ -4,13 +4,17 @@ import re
 import sys
 import argparse
 import numpy as np
+import matplotlib.pyplot as mpl
 
 from common.mappability_corgi import MappabilityTrack
-from common.ref_func_corgi import HG38_SIZES, LEXICO_2_IND, makedir
+from common.ref_func_corgi import HG38_SIZES, T2T11_SIZES, LEXICO_2_IND, makedir
 
 # samtools view input.bam | python3 get_zmw_coverage.py <args>
 
 REF_CHAR = 'MX=D'
+
+REFFILE_NAMES = {'hg38': HG38_SIZES,
+                 't2t':  T2T11_SIZES}
 
 def strip_polymerase_coords(rn):
 	return '/'.join(rn.split('/')[:-1])
@@ -23,11 +27,11 @@ def is_valid_coord(my_chr, my_pos, bed_list=[]):
 #
 # returns (total_bases_mapped, avg_cov, total_uncov_pos, fraction_uncov_pos, nonexcluded_pos)
 #
-def reads_2_cov(my_chr, readpos_list_all, out_dir, bed_list=[]):
-	if my_chr not in HG38_SIZES:
+def reads_2_cov(my_chr, readpos_list_all, out_dir, bed_list=[], plot_list=[]):
+	if my_chr not in CONTIG_SIZES:
 		print('skipping '+my_chr+'...')
 		return None
-	denom   = HG38_SIZES[my_chr]
+	denom   = CONTIG_SIZES[my_chr]
 	oob_pos = 0						# num out-of-bounds positions
 	for i in range(len(bed_list)):
 		if my_chr in bed_list[i].all_tracks:
@@ -35,9 +39,9 @@ def reads_2_cov(my_chr, readpos_list_all, out_dir, bed_list=[]):
 			for j in range(1, len(track)-1, 2):
 				denom   -= track[j+1]-track[j]
 				oob_pos += track[j+1]-track[j]
-			#print(HG38_SIZES[my_chr], '-->', denom)
-	#cov = np.zeros(HG38_SIZES[my_chr] , dtype='<B')
-	cov = np.zeros(HG38_SIZES[my_chr] , dtype='<i4')
+			#print(CONTIG_SIZES[my_chr], '-->', denom)
+	#cov = np.zeros(CONTIG_SIZES[my_chr] , dtype='<B')
+	cov = np.zeros(CONTIG_SIZES[my_chr] , dtype='<i4')
 
 	readlens = []
 	print('computing zmw coverage on '+my_chr+'...')
@@ -77,6 +81,16 @@ def reads_2_cov(my_chr, readpos_list_all, out_dir, bed_list=[]):
 	print('saving ' + out_fn + '.npz...')
 	np.savez_compressed(out_file, cov, out_fn)
 
+	# plot stuff
+	for i in range(len(plot_list)):
+		x = list(range(plot_list[i][0], plot_list[i][1]))
+		y = cov[plot_list[i][0]:plot_list[i][1]]
+		mpl.figure(i)
+		mpl.plot(x,y)
+		mpl.ylabel('ZMW coverage')
+		mpl.title(my_chr + ' : ' + str(plot_list[i][0]) + ' - ' + str(plot_list[i][1]))
+		mpl.show()
+
 	# stats
 	total_bases = np.sum(cov)
 	avg_cov     = total_bases/float(denom)
@@ -91,9 +105,12 @@ def reads_2_cov(my_chr, readpos_list_all, out_dir, bed_list=[]):
 # parse input args
 #
 parser = argparse.ArgumentParser(description='get_zmw_coverage.py')
-parser.add_argument('-m', type=str, required=True,  metavar='<str>', help="* mode (CCS/CLR)")
-parser.add_argument('-o', type=str, required=True,  metavar='<str>', help="* /path/to/output/dir/")
-parser.add_argument('-b', type=str, required=False, metavar='<str>', help="/path/to/bed/dir/", default=None)
+parser.add_argument('-m',  type=str, required=True,  metavar='<str>', help="* mode (CCS/CLR)")
+parser.add_argument('-o',  type=str, required=True,  metavar='<str>', help="* /path/to/output/dir/")
+parser.add_argument('-p',  type=str, required=False, metavar='<str>', help="plot_regions.bed",    default=None)
+parser.add_argument('-q',  type=int, required=False, metavar='<int>', help="minimum MAPQ",        default=0)
+parser.add_argument('-r',  type=str, required=False, metavar='<str>', help="refname (hg38, t2t)", default='hg38')
+parser.add_argument('-bd', type=str, required=False, metavar='<str>', help="/path/to/bed/dir/",   default=None)
 args = parser.parse_args()
 
 READ_MODE = args.m
@@ -107,13 +124,40 @@ if OUT_PATH[-1] != '/':
 makedir(OUT_PATH)
 OUT_REPORT = OUT_PATH+'cov_report.tsv'
 
-RESOURCE_PATH = args.b
+MIN_MAPQ = max([0,args.q])
+
+REF_VERS = args.r
+if REF_VERS not in REFFILE_NAMES:
+	print('Error: Refname (-r) must be one of the following:')
+	print(sorted(REFFILE_NAMES.keys()))
+	exit(1)
+CONTIG_SIZES = REFFILE_NAMES[REF_VERS]
+print('Using contig sizes:', REF_VERS)
+
+RESOURCE_PATH = args.bd
 if RESOURCE_PATH == None:
 	SIM_PATH = '/'.join(os.path.realpath(__file__).split('/')[:-1]) + '/'
 	RESOURCE_PATH = SIM_PATH + 'resources/'
 if RESOURCE_PATH[-1] != '/':
 	RESOURCE_PATH += '/'
-EXCL_BED = [MappabilityTrack(RESOURCE_PATH + 'hg38_centromere-and-gap_unsorted.bed', bed_buffer=1000)]
+
+EXCL_BED = []
+if REF_VERS == 'hg38':
+	print('Using bed of hg38 gap+centromere regions to exclude...')
+	EXCL_BED = [MappabilityTrack(RESOURCE_PATH + 'hg38_centromere-and-gap_unsorted.bed', bed_buffer=1000)]
+elif REF_VERS == 't2t':
+	print('Using T2T ref, so not excluding any regions...')
+
+PLOT_BED_NAME = args.p
+PLOT_BED_DICT = {}
+if PLOT_BED_NAME != None:
+	f = open(PLOT_BED_NAME, 'r')
+	for line in f:
+		splt = line.strip().split('\t')
+		if splt[0] not in PLOT_BED_DICT:
+			PLOT_BED_DICT[splt[0]] = []
+		PLOT_BED_DICT[splt[0]].append((int(splt[1]), int(splt[2])))
+	f.close()
 
 #
 #
@@ -135,10 +179,14 @@ for line in input_stream:
 		splt  = line.strip().split('\t')
 		ref   = splt[2]
 		pos   = int(splt[3])
+		mapq  = int(splt[4])
 		cigar = splt[5]
 
 		if ref == '*':		# skip unmapped reads
 			break			# it's safe to quit at this point, right?
+
+		if mapq < MIN_MAPQ:
+			continue
 
 		#if pos > 1000000:	# for debugging purposes
 		#	continue
@@ -153,10 +201,13 @@ for line in input_stream:
 
 		if ref != prev_ref:
 			# compute coverage on previous ref now that we're done
-			if prev_ref != None and len(alns_by_zmw) and prev_ref in HG38_SIZES:
-				covdat_by_ref[prev_ref] = reads_2_cov(prev_ref, alns_by_zmw, OUT_PATH, EXCL_BED)
+			if prev_ref != None and len(alns_by_zmw) and prev_ref in CONTIG_SIZES:
+				plot_regions = []
+				if prev_ref in PLOT_BED_DICT:
+					plot_regions = PLOT_BED_DICT[prev_ref]
+				covdat_by_ref[prev_ref] = reads_2_cov(prev_ref, alns_by_zmw, OUT_PATH, bed_list=EXCL_BED, plot_list=plot_regions)
 			# reset for next ref
-			if ref in HG38_SIZES:
+			if ref in CONTIG_SIZES:
 				print('processing reads on '+ref+'...')
 			else:
 				print('skipping reads on '+ref+'...')
@@ -164,7 +215,7 @@ for line in input_stream:
 			rnm_dict = {}
 			prev_ref = ref
 
-		if ref not in HG38_SIZES:
+		if ref not in CONTIG_SIZES:
 			continue
 
 		letters = re.split(r"\d+",cigar)[1:]
@@ -190,8 +241,11 @@ for line in input_stream:
 		rlen_by_zmw[my_rind] = max([rlen_by_zmw[my_rind], template_len])
 
 # we probably we need to process the final ref, assuming no contigs beyond chrM
-if ref not in covdat_by_ref and len(alns_by_zmw) and ref in HG38_SIZES:
-	covdat_by_ref[ref] = reads_2_cov(ref, alns_by_zmw, OUT_PATH, EXCL_BED)
+if ref not in covdat_by_ref and len(alns_by_zmw) and ref in CONTIG_SIZES:
+	plot_regions = []
+	if ref in PLOT_BED_DICT:
+		plot_regions = PLOT_BED_DICT[ref]
+	covdat_by_ref[ref] = reads_2_cov(ref, alns_by_zmw, OUT_PATH, bed_list=EXCL_BED, plot_list=plot_regions)
 
 # sum up data across chromosomes to get whole-genome stats
 all_mapped_bases = 0
