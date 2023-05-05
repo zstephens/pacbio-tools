@@ -1,20 +1,20 @@
 #!/usr/bin/env python
-import os
-import re
-import sys
 import argparse
 import numpy as np
 import matplotlib.pyplot as mpl
+import os
+import pysam
+import re
+import sys
 
 from common.mappability_corgi import MappabilityTrack
-from common.ref_func_corgi import HG38_SIZES, T2T11_SIZES, LEXICO_2_IND, makedir
-
-# samtools view input.bam | python3 get_zmw_coverage.py <args>
+from common.ref_func_corgi    import HG38_SIZES, T2T11_SIZES, TELOGATOR_SIZES, LEXICO_2_IND, makedir
 
 REF_CHAR = 'MX=D'
 
-REFFILE_NAMES = {'hg38': HG38_SIZES,
-                 't2t':  T2T11_SIZES}
+REFFILE_NAMES = {'hg38':      HG38_SIZES,
+                 't2t':       T2T11_SIZES,
+                 'telogator': TELOGATOR_SIZES}
 
 def strip_polymerase_coords(rn):
 	return '/'.join(rn.split('/')[:-1])
@@ -27,7 +27,7 @@ def is_valid_coord(my_chr, my_pos, bed_list=[]):
 #
 # returns (total_bases_mapped, avg_cov, total_uncov_pos, fraction_uncov_pos, nonexcluded_pos)
 #
-def reads_2_cov(my_chr, readpos_list_all, out_dir, bed_list=[], plot_list=[]):
+def reads_2_cov(my_chr, readpos_list_all, out_dir, CONTIG_SIZES, bed_list=[], plot_list=[]):
 	if my_chr not in CONTIG_SIZES:
 		print('skipping '+my_chr+'...')
 		return None
@@ -102,81 +102,94 @@ def reads_2_cov(my_chr, readpos_list_all, out_dir, bed_list=[], plot_list=[]):
 	return (total_bases, avg_cov, total_unmap, avg_unmap, denom)
 
 #
-# parse input args
+# main()
 #
-parser = argparse.ArgumentParser(description='get_zmw_coverage.py')
-parser.add_argument('-m',  type=str, required=True,  metavar='<str>', help="* mode (CCS/CLR)")
-parser.add_argument('-o',  type=str, required=True,  metavar='<str>', help="* /path/to/output/dir/")
-parser.add_argument('-p',  type=str, required=False, metavar='<str>', help="plot_regions.bed",    default=None)
-parser.add_argument('-q',  type=int, required=False, metavar='<int>', help="minimum MAPQ",        default=0)
-parser.add_argument('-r',  type=str, required=False, metavar='<str>', help="refname (hg38, t2t)", default='hg38')
-parser.add_argument('-bd', type=str, required=False, metavar='<str>', help="/path/to/bed/dir/",   default=None)
-args = parser.parse_args()
+def main(raw_args=None):
+	parser = argparse.ArgumentParser(description='get_zmw_coverage.py')
+	parser.add_argument('-i',  type=str, required=True,  metavar='<str>', help="* input.bam")
+	parser.add_argument('-m',  type=str, required=True,  metavar='<str>', help="* mode (CCS/CLR)")
+	parser.add_argument('-o',  type=str, required=True,  metavar='<str>', help="* /path/to/output/dir/")
+	parser.add_argument('-p',  type=str, required=False, metavar='<str>', help="plot_regions.bed",               default=None)
+	parser.add_argument('-q',  type=int, required=False, metavar='<int>', help="minimum MAPQ",                   default=0)
+	parser.add_argument('-r',  type=str, required=False, metavar='<str>', help="refname (hg38, t2t, telogator)", default='hg38')
+	parser.add_argument('-bd', type=str, required=False, metavar='<str>', help="/path/to/bed/dir/",              default=None)
+	args = parser.parse_args()
 
-READ_MODE = args.m
-if READ_MODE not in ['CCS', 'CLR']:
-	print('Error: Unknown read mode.')
-	exit(1)
+	IN_BAM = args.i
 
-OUT_PATH = args.o
-if OUT_PATH[-1] != '/':
-	OUT_PATH += '/'
-makedir(OUT_PATH)
-OUT_REPORT = OUT_PATH+'cov_report.tsv'
+	READ_MODE = args.m
+	if READ_MODE not in ['CCS', 'CLR']:
+		print('Error: Unknown read mode.')
+		exit(1)
 
-MIN_MAPQ = max([0,args.q])
+	OUT_PATH = args.o
+	if OUT_PATH[-1] != '/':
+		OUT_PATH += '/'
+	makedir(OUT_PATH)
+	OUT_REPORT = OUT_PATH+'cov_report.tsv'
 
-REF_VERS = args.r
-if REF_VERS not in REFFILE_NAMES:
-	print('Error: Refname (-r) must be one of the following:')
-	print(sorted(REFFILE_NAMES.keys()))
-	exit(1)
-CONTIG_SIZES = REFFILE_NAMES[REF_VERS]
-print('Using contig sizes:', REF_VERS)
+	MIN_MAPQ = max([0,args.q])
 
-RESOURCE_PATH = args.bd
-if RESOURCE_PATH == None:
-	SIM_PATH = '/'.join(os.path.realpath(__file__).split('/')[:-1]) + '/'
-	RESOURCE_PATH = SIM_PATH + 'resources/'
-if RESOURCE_PATH[-1] != '/':
-	RESOURCE_PATH += '/'
+	REF_VERS = args.r
+	if REF_VERS not in REFFILE_NAMES:
+		print('Error: Refname (-r) must be one of the following:')
+		print(sorted(REFFILE_NAMES.keys()))
+		exit(1)
+	CONTIG_SIZES = REFFILE_NAMES[REF_VERS]
+	print('Using contig sizes:', REF_VERS)
 
-EXCL_BED = []
-if REF_VERS == 'hg38':
-	print('Using bed of hg38 gap+centromere regions to exclude...')
-	EXCL_BED = [MappabilityTrack(RESOURCE_PATH + 'hg38_centromere-and-gap_unsorted.bed', bed_buffer=1000)]
-elif REF_VERS == 't2t':
-	print('Using T2T ref, so not excluding any regions...')
+	RESOURCE_PATH = args.bd
+	if RESOURCE_PATH == None:
+		SIM_PATH = '/'.join(os.path.realpath(__file__).split('/')[:-1]) + '/'
+		RESOURCE_PATH = SIM_PATH + 'resources/'
+	if RESOURCE_PATH[-1] != '/':
+		RESOURCE_PATH += '/'
 
-PLOT_BED_NAME = args.p
-PLOT_BED_DICT = {}
-if PLOT_BED_NAME != None:
-	f = open(PLOT_BED_NAME, 'r')
-	for line in f:
-		splt = line.strip().split('\t')
-		if splt[0] not in PLOT_BED_DICT:
-			PLOT_BED_DICT[splt[0]] = []
-		PLOT_BED_DICT[splt[0]].append((int(splt[1]), int(splt[2])))
-	f.close()
+	EXCL_BED = []
+	if REF_VERS == 'hg38':
+		print('Using bed of hg38 gap+centromere regions to exclude...')
+		EXCL_BED = [MappabilityTrack(RESOURCE_PATH + 'hg38_centromere-and-gap_unsorted.bed', bed_buffer=1000)]
+	elif REF_VERS == 't2t':
+		print('Using T2T ref, so not excluding any regions...')
+	elif REF_VERS == 'telogator':
+		print('Using T2T-telogator ref, so not excluding any regions...')
 
-#
-#
-#
-if not sys.stdin.isatty():
-	input_stream = sys.stdin
-else:
-	print('No input.')
-	exit(1)
+	PLOT_BED_NAME = args.p
+	PLOT_BED_DICT = {}
+	if PLOT_BED_NAME != None:
+		f = open(PLOT_BED_NAME, 'r')
+		for line in f:
+			splt = line.strip().split('\t')
+			if splt[0] not in PLOT_BED_DICT:
+				PLOT_BED_DICT[splt[0]] = []
+			PLOT_BED_DICT[splt[0]].append((int(splt[1]), int(splt[2])))
+		f.close()
 
-prev_ref = None
-rnm_dict = {}
-alns_by_zmw = []	# alignment start/end per zmw
-rlen_by_zmw = []	# max tlen observed for each zmw
-covdat_by_ref = {}	#
+	prev_ref = None
+	rnm_dict = {}
+	alns_by_zmw = []	# alignment start/end per zmw
+	rlen_by_zmw = []	# max tlen observed for each zmw
+	covdat_by_ref = {}	#
 
-for line in input_stream:
-	if len(line) and line[0] != '#':
-		splt  = line.strip().split('\t')
+	#
+	#
+	#
+	samfile = pysam.AlignmentFile(IN_BAM, "rb")
+	refseqs = samfile.references
+	#
+	for aln in samfile.fetch(until_eof=True):
+		splt = str(aln).split('\t')
+		my_ref_ind  = splt[2].replace('#','')	# why would there ever be a # symbol here? I don't know.
+		# pysam is dumb and prints ref indices instead of contig name
+		# - except unmapped, which is '*'
+		# - and I've also seen it spit out '-1' ...
+		if my_ref_ind.isdigit():
+			splt[2] = refseqs[int(my_ref_ind)]
+		elif my_ref_ind == '-1':
+			splt[2] = refseqs[-1]
+		else:
+			splt[2] = my_ref_ind
+		#
 		ref   = splt[2]
 		pos   = int(splt[3])
 		mapq  = int(splt[4])
@@ -205,7 +218,7 @@ for line in input_stream:
 				plot_regions = []
 				if prev_ref in PLOT_BED_DICT:
 					plot_regions = PLOT_BED_DICT[prev_ref]
-				covdat_by_ref[prev_ref] = reads_2_cov(prev_ref, alns_by_zmw, OUT_PATH, bed_list=EXCL_BED, plot_list=plot_regions)
+				covdat_by_ref[prev_ref] = reads_2_cov(prev_ref, alns_by_zmw, OUT_PATH, CONTIG_SIZES, bed_list=EXCL_BED, plot_list=plot_regions)
 			# reset for next ref
 			if ref in CONTIG_SIZES:
 				print('processing reads on '+ref+'...')
@@ -239,47 +252,51 @@ for line in input_stream:
 
 		alns_by_zmw[my_rind].append((pos, pos+adj))
 		rlen_by_zmw[my_rind] = max([rlen_by_zmw[my_rind], template_len])
+	samfile.close()
 
-# we probably we need to process the final ref, assuming no contigs beyond chrM
-if ref not in covdat_by_ref and len(alns_by_zmw) and ref in CONTIG_SIZES:
-	plot_regions = []
-	if ref in PLOT_BED_DICT:
-		plot_regions = PLOT_BED_DICT[ref]
-	covdat_by_ref[ref] = reads_2_cov(ref, alns_by_zmw, OUT_PATH, bed_list=EXCL_BED, plot_list=plot_regions)
+	# we probably we need to process the final ref, assuming no contigs beyond chrM
+	if ref not in covdat_by_ref and len(alns_by_zmw) and ref in CONTIG_SIZES:
+		plot_regions = []
+		if ref in PLOT_BED_DICT:
+			plot_regions = PLOT_BED_DICT[ref]
+		covdat_by_ref[ref] = reads_2_cov(ref, alns_by_zmw, OUT_PATH, CONTIG_SIZES, bed_list=EXCL_BED, plot_list=plot_regions)
 
-# sum up data across chromosomes to get whole-genome stats
-all_mapped_bases = 0
-all_uncovered    = 0
-all_denom        = 0
-for k in covdat_by_ref.keys():
-	if k != None:
-		all_mapped_bases += covdat_by_ref[k][0]
-		all_uncovered    += covdat_by_ref[k][2]
-		all_denom        += covdat_by_ref[k][4]
-all_avg_cov    = all_mapped_bases/float(all_denom)
-all_unmap_frac = all_uncovered/float(all_denom)
+	# sum up data across chromosomes to get whole-genome stats
+	all_mapped_bases = 0
+	all_uncovered    = 0
+	all_denom        = 0
+	for k in covdat_by_ref.keys():
+		if k != None:
+			all_mapped_bases += covdat_by_ref[k][0]
+			all_uncovered    += covdat_by_ref[k][2]
+			all_denom        += covdat_by_ref[k][4]
+	all_avg_cov    = all_mapped_bases/float(all_denom)
+	all_unmap_frac = all_uncovered/float(all_denom)
 
-# remove 0-len tlens that shouldn't be here but are for some reason
-rlen_by_zmw = [n for n in rlen_by_zmw if n > 0]
+	# remove 0-len tlens that shouldn't be here but are for some reason
+	rlen_by_zmw = [n for n in rlen_by_zmw if n > 0]
 
-# final output report
-sorted_refs = [n[1] for n in sorted([(LEXICO_2_IND[k],k) for k in covdat_by_ref.keys()])]
-f = open(OUT_REPORT, 'w')
-f.write('\t'.join(['CHR', 'MAPPED_BASES', 'AVG_COV', 'UNMAPPED_BASES', 'UNMAPPED_FRAC']) + '\n')
-f.write('\t'.join(['ALL', str(all_mapped_bases), '{0:0.3f}'.format(all_avg_cov), str(all_uncovered), '{0:0.3f}'.format(all_unmap_frac)]) + '\n')
-for k in sorted_refs:
-	cd = covdat_by_ref[k]
-	f.write('\t'.join([k, str(cd[0]), '{0:0.3f}'.format(cd[1]), str(cd[2]), '{0:0.3f}'.format(cd[3])]) + '\n')
-f.close()
+	# final output report
+	sorted_refs = [n[1] for n in sorted([(LEXICO_2_IND[k],k) for k in covdat_by_ref.keys()])]
+	f = open(OUT_REPORT, 'w')
+	f.write('\t'.join(['CHR', 'MAPPED_BASES', 'AVG_COV', 'UNMAPPED_BASES', 'UNMAPPED_FRAC']) + '\n')
+	f.write('\t'.join(['ALL', str(all_mapped_bases), '{0:0.3f}'.format(all_avg_cov), str(all_uncovered), '{0:0.3f}'.format(all_unmap_frac)]) + '\n')
+	for k in sorted_refs:
+		cd = covdat_by_ref[k]
+		f.write('\t'.join([k, str(cd[0]), '{0:0.3f}'.format(cd[1]), str(cd[2]), '{0:0.3f}'.format(cd[3])]) + '\n')
+	f.close()
 
-# stats
-print('')
-print('mean read length:      ', int(np.mean(rlen_by_zmw)))
-print('median read length:    ', int(np.median(rlen_by_zmw)))
-if 'chrX' in covdat_by_ref and 'chrY' in covdat_by_ref:
-	print('chrX:chrY mapped bases:', '{0:0.3f}'.format(covdat_by_ref['chrX'][0]/float(covdat_by_ref['chrY'][0])))
-if 'chrX' in covdat_by_ref and 'chr2' in covdat_by_ref:
-	print('chrX:chr2 mapped bases:', '{0:0.3f}'.format(covdat_by_ref['chrX'][0]/float(covdat_by_ref['chr2'][0])))
-if 'chrM' in covdat_by_ref and 'chr2' in covdat_by_ref:
-	print('chrM:chr2 mapped bases:', '{0:0.3f}'.format(covdat_by_ref['chrM'][0]/float(covdat_by_ref['chr2'][0])))
-print('')
+	# stats
+	print('')
+	print('mean read length:      ', int(np.mean(rlen_by_zmw)))
+	print('median read length:    ', int(np.median(rlen_by_zmw)))
+	if 'chrX' in covdat_by_ref and 'chrY' in covdat_by_ref:
+		print('chrX:chrY mapped bases:', '{0:0.3f}'.format(covdat_by_ref['chrX'][0]/float(covdat_by_ref['chrY'][0])))
+	if 'chrX' in covdat_by_ref and 'chr2' in covdat_by_ref:
+		print('chrX:chr2 mapped bases:', '{0:0.3f}'.format(covdat_by_ref['chrX'][0]/float(covdat_by_ref['chr2'][0])))
+	if 'chrM' in covdat_by_ref and 'chr2' in covdat_by_ref:
+		print('chrM:chr2 mapped bases:', '{0:0.3f}'.format(covdat_by_ref['chrM'][0]/float(covdat_by_ref['chr2'][0])))
+	print('')
+
+if __name__ == '__main__':
+	main()

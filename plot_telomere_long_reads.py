@@ -110,14 +110,15 @@ def is_subtel(my_chr, my_pos_list, relaxed=False):
 # returns reference span
 REF_CHAR  = 'MX=D'
 READ_CHAR = 'MX=I'
+CLIP_CHAR = 'SH'
 def parse_cigar(cigar):
 	letters = re.split(r"\d+",cigar)[1:]
 	numbers = [int(n) for n in re.findall(r"\d+",cigar)]
 	startPos = 0
-	if letters[0] == 'S':
+	if letters[0] in CLIP_CHAR:
 		startPos = numbers[0]
 	endClip = 0
-	if len(letters) > 1 and letters[-1] == 'S':
+	if len(letters) > 1 and letters[-1] in CLIP_CHAR:
 		endClip = numbers[-1]
 	adj  = 0
 	radj = 0
@@ -156,16 +157,51 @@ def get_nearest_transcript(myChr, pos, bedDat, max_dist=20000):
 			return (closest_dist, closest_meta)
 	return None
 
+def is_same_type(t1, t2):
+	if t1 == t2:
+		return True
+	if (t1 == 'tel' and t2 == 'tel?') or (t1 == 'tel?' and t2 == 'tel'):
+		return True
+	return False
+
+RC_DICT = {'A':'T','C':'G','G':'C','T':'A','N':'N'}
+def RC(s):
+	return ''.join([RC_DICT[n] for n in s[::-1]])
+
+TEL_REPEAT_SEQ  = ['TTAGGG', 'TCAGGG', 'TGAGGG', 'TTGGGG']
+TEL_REPEAT_SEQ += [RC(n) for n in TEL_REPEAT_SEQ]
+
+def count_tel_repeat_bases_in_string(s):
+	t = np.zeros(len(s))
+	for i in range(len(s)-6):
+		for n in TEL_REPEAT_SEQ:
+			if s[i:i+len(n)] == n:
+				t[i:i+len(n)] = 1
+	return int(np.sum(t))
+
+CASE_NUMBER_COMPLEX = 97
+CASE_NUMBER_TELONLY = 98
+CASE_NUMBER_DISCARD = 99
+
+# add the telomere content of reference alignments to their adjacent telomere alignments
+# if at least this fraction of the alignment is comprised of telomere sequences
+MIN_TEL_FRAC_TO_ADD_TELSEQ_BASES = 0.05
+# only consider sub-seq-tel cases if len(sub) is at least this much larger than len(seq)
+MIN_SUB_TO_SEQ_LEN_RATIO = 2.0
+
 #
 #
 #
 parser = argparse.ArgumentParser(description='plot_telomere_long_reads.py')
-parser.add_argument('-s', type=str, required=True, metavar='<str>', help="* input.sam")
+parser.add_argument('-i', type=str, required=True, metavar='<str>', help="* input.sam")
 parser.add_argument('-o', type=str, required=True, metavar='<str>', help="* output_dir/")
+parser.add_argument('-c', type=str, required=False, default=None,   metavar='<str>',     help="tsv of ground truth tel lens to compare against")
 parser.add_argument('-j', type=str, required=False, default=None,   metavar='<str>',     help="skip read processing and just plot tel lens from this json")
 parser.add_argument('--skip-plot',  required=False, default=False,  action='store_true', help='skip individual read plotting')
+parser.add_argument('--pbsim',      required=False, default=False,  action='store_true', help='input is pbsim reads, print out confusion matrix')
 args = parser.parse_args()
 
+INPUT_SAM  = args.i
 OUT_DIR    = args.o
 if OUT_DIR[-1] != '/':
 	OUT_DIR += '/'
@@ -174,10 +210,13 @@ OUT_REPORT = OUT_DIR + 'junctions.tsv'
 TEL_JSON   = OUT_DIR + 'tel_lens.json'
 TEL_FASTA  = OUT_DIR + 'tel_sequences.fa'
 PLOT_DIR   = OUT_DIR + 'read_plots/'
+QCPLOT_DIR = OUT_DIR + 'qc/'
 makedir(PLOT_DIR)
+makedir(QCPLOT_DIR)
 
 SUMMARY_SCATTER = OUT_DIR + 'tel_lens_scatter.png'
 SUMMARY_VIOLIN  = OUT_DIR + 'tel_lens_violin.png'
+CONFUSION_PLOT  = OUT_DIR + 'subtel_confusion_matrix.png'
 
 INPUT_JSON = args.j
 USE_JSON   = False
@@ -189,7 +228,20 @@ if INPUT_JSON != None and exists_and_is_nonZero(INPUT_JSON):
 	f.close()
 	USE_JSON = True
 
+INPUT_COMP = args.c
+COMP_DICT  = {}
+if INPUT_COMP != None and exists_and_is_nonZero(INPUT_COMP):
+	print('== Reading in ground truth tel lens for comparison ==')
+	f = open(INPUT_COMP, 'r')
+	for line in f:
+		splt = line.strip().split('\t')
+		COMP_DICT[splt[0]] = int(splt[1])
+	f.close()
+
 SKIP_READ_PLOTS = args.skip_plot
+READS_ARE_PBSIM = args.pbsim
+
+mpl.rcParams.update({'font.size': 18, 'font.weight':'bold'})
 
 if ANCHORED_TEL_JSON == None:
 	# [readpos_start, readpos_end, ref, pos_start, pos_end, orientation, mapq]
@@ -197,7 +249,8 @@ if ANCHORED_TEL_JSON == None:
 	READDAT_BY_RNAME = {}
 	READLEN_BY_RNAME = {}
 
-	f = open(args.s, 'r')
+	print('reading SAM input...')
+	f = open(INPUT_SAM, 'r')
 	for line in f:
 		splt = line.strip().split('\t')
 		cigar = splt[5]
@@ -256,11 +309,19 @@ if ANCHORED_TEL_JSON == None:
 	skip_count   = {'only_tel':0, '2_tel_flank':0, '0_tel_flank':0}
 	ALL_TEL_LENS = []
 	ANCHORED_TEL = {}
+	ANCHORED_POS = {}
+	CONF_DAT     = {}
 	CHR_FAILED_TO_ANCHOR = {}
 
+	print('processing reads...')
 	for k in sorted(ALIGNMENTS_BY_RNAME.keys()):
-		#print(k)
 		abns_k = sorted(ALIGNMENTS_BY_RNAME[k])
+
+		#print(k)
+		#for n in abns_k:
+		#	print(n)
+		#continue
+
 		for i in range(len(abns_k)):
 			n = sorted(abns_k)[i]
 			#print(n)
@@ -323,13 +384,13 @@ if ANCHORED_TEL_JSON == None:
 					affected_genes.append(out_nge)
 				anchorseq_right = a[2] + ':' + str(a[3]) + ':' + a[5] + ':' + str(a[0] - abns_k[max(n)][1]) + ':' + out_nge
 
-			myAnchor = 'l'*anchored_left+'r'*anchored_right
+			anchor_str = 'l'*anchored_left+'r'*anchored_right
 
 			seq_name  = ''
 			seq_name += k + DELIM_MAJOR												# read name
 			seq_name += DELIM_MINOR.join([abns_k[m][2]+':'+abns_k[m][5] for m in n]) + DELIM_MAJOR	# viral refs this read spans
 			#seq_name += DELIM_MINOR.join([str(m) for m in n]) + DELIM_MAJOR		# aln num of viral alignments (out of all alignments in the read)
-			seq_name += myAnchor										# anchored on left, right, or both?
+			seq_name += anchor_str										# anchored on left, right, or both?
 			if len(anchorseq_left):
 				seq_name += DELIM_MAJOR + anchorseq_left
 			if len(anchorseq_right):
@@ -367,93 +428,188 @@ if ANCHORED_TEL_JSON == None:
 				else:
 					type_dat.append('seq')
 
+		#
+		my_case = None
+
 		# skip: ALL TEL
-		if all([n[:3] == 'tel' for n in type_dat]):
+		if my_case == None and all([n[:3] == 'tel' for n in type_dat]):
 			my_tel_len = sum([abs(n[1]-n[0]) for n in abns_k])
 			if 'unanchored' not in ANCHORED_TEL:
 				ANCHORED_TEL['unanchored'] = []
 			ANCHORED_TEL['unanchored'].append(my_tel_len)
 			ALL_TEL_LENS.append(my_tel_len)
 			skip_count['only_tel'] += 1
-			continue
+			my_case = CASE_NUMBER_TELONLY
+
+			if READS_ARE_PBSIM:
+				conf_key = (k.split('-')[1].replace('_',''), 'unanchored')
+				if conf_key not in CONF_DAT:
+					CONF_DAT[conf_key] = 0
+				CONF_DAT[conf_key] += 1
 
 		# skip: TEL ON BOTH FLANKS
-		if type_dat[0][:3] == 'tel' and type_dat[-1][:3] == 'tel':
+		if my_case == None and type_dat[0][:3] == 'tel' and type_dat[-1][:3] == 'tel':
 			skip_count['2_tel_flank'] += 1
-			continue
+			my_case = CASE_NUMBER_DISCARD
 
-		# skip: TEL ON NO FLANKS ("tel?" doesn't count here)
-		if type_dat[0] != 'tel' and type_dat[-1] != 'tel':
-			skip_count['0_tel_flank'] += 1
-			continue
-
-		# collapse all adjacent TEL / SUBTEL / SEQ into single spans
-		current_start = 0
-		current_type  = type_dat[0]
-		type_ranges   = []
-		for i in range(1,len(type_dat)):
-			if type_dat[i] != current_type:
-				type_ranges.append([current_start, i-1, current_type])
-				current_start = i
-				current_type  = type_dat[i]
-		type_ranges.append([current_start, len(type_dat)-1, current_type])
-		collapsed_types = [n[2] for n in type_ranges]
-
-		#print(type_ranges)
-		#for i in range(len(abns_k)):
-		#	print(i, abns_k[i], subtel_dat[i])
-		#print('')
-		#continue
+		####print_me = False
+		####for i in range(len(abns_k)):
+		####	#if abns_k[i][2] == 'tel6p':
+		####	#	print_me = True
+		####	if abns_k[i][2] == 'chr8' and subtel_dat[i] != None and subtel_dat[i][1] == 'p':
+		####		print_me = True
+		####if print_me:
+		####	for i in range(len(abns_k)):
+		####		print(i, abns_k[i], subtel_dat[i])
+		####	print('')
+		####continue
 
 		# annotate according to case type
 		pick_anchor_from_inds = []
 		get_tel_len_from_inds = []
-		my_case = None
+		anchor_orientation    = None
+		my_anchor_pos         = None
+		tel_bases_in_seq      = None
+		tel_frac              = 0.
 
-		# case 1a & 1b
-		if collapsed_types == ['sub', 'tel']:
-			pick_anchor_from_inds = [0]
-			get_tel_len_from_inds = [1]
-			my_case = 1
-		elif collapsed_types == ['tel', 'sub']:
-			pick_anchor_from_inds = [1]
-			get_tel_len_from_inds = [0]
-			my_case = 1
-		# case 2a & 2b
-		elif collapsed_types == ['seq', 'tel']:
-			pick_anchor_from_inds = [0]
-			get_tel_len_from_inds = [1]
-			my_case = 2
-		elif collapsed_types == ['tel', 'seq']:
-			pick_anchor_from_inds = [1]
-			get_tel_len_from_inds = [0]
-			my_case = 2
-		# case 3a & 3b
-		elif collapsed_types == ['seq', 'sub', 'tel']:
-			pick_anchor_from_inds = [0,1]
-			get_tel_len_from_inds = [2]
-			my_case = 3
-		elif collapsed_types == ['tel', 'sub', 'seq']:
-			pick_anchor_from_inds = [1,2]
-			get_tel_len_from_inds = [0]
-			my_case = 3
-		# uhhh..
-		else:
-			my_case = 4
+		if my_case != CASE_NUMBER_DISCARD and my_case != CASE_NUMBER_TELONLY:
+			# collapse all adjacent TEL / SUBTEL / SEQ into single spans
+			current_start = 0
+			current_type  = type_dat[0]
+			type_ranges   = []
+			for i in range(1,len(type_dat)):
+				if is_same_type(type_dat[i], current_type) == False:	# merge tel? into adjacent tel
+					type_ranges.append([current_start, i-1, current_type])
+					current_start = i
+					current_type  = type_dat[i]
+			type_ranges.append([current_start, len(type_dat)-1, current_type])
+			collapsed_types = [n[2] for n in type_ranges]
+
+			#print(type_ranges)
+			#for i in range(len(abns_k)):
+			#	print(i, abns_k[i], subtel_dat[i])
+			#print('')
+			#continue
+
+			# case 1a & 1b
+			if collapsed_types == ['sub', 'tel']:
+				pick_anchor_from_inds = [0]
+				get_tel_len_from_inds = [1]
+				anchor_orientation    = 'right'
+				my_case = 1
+			elif collapsed_types == ['tel', 'sub']:
+				pick_anchor_from_inds = [1]
+				get_tel_len_from_inds = [0]
+				anchor_orientation    = 'left'
+				my_case = 1
+
+			# case 2a & 2b
+			elif collapsed_types == ['seq', 'tel']:
+				pick_anchor_from_inds = [0]
+				get_tel_len_from_inds = [1]
+				anchor_orientation    = 'right'
+				my_case = 2
+			elif collapsed_types == ['tel', 'seq']:
+				pick_anchor_from_inds = [1]
+				get_tel_len_from_inds = [0]
+				anchor_orientation    = 'left'
+				my_case = 2
+
+			# case 3a & 3b
+			elif collapsed_types == ['seq', 'sub', 'tel']:
+				pick_anchor_from_inds = [0,1]
+				get_tel_len_from_inds = [2]
+				anchor_orientation    = 'right'
+				my_case = 3
+			elif collapsed_types == ['tel', 'sub', 'seq']:
+				pick_anchor_from_inds = [1,2]
+				get_tel_len_from_inds = [0]
+				anchor_orientation    = 'left'
+				my_case = 3
+
+			# case 4a & 4b
+			elif collapsed_types == ['tel', 'seq', 'sub'] or collapsed_types == ['sub', 'seq', 'tel']:
+				my_seq_range     = list(range(type_ranges[1][0],type_ranges[1][1]+1))
+				seq_len_sum      = sum([abs(abns_k[n][3] - abns_k[n][4]) for n in my_seq_range])
+				#(rs1, rs2)      = (abns_k[my_seq_range[0]][0], abns_k[my_seq_range[-1]][1])
+				rs1 = min([abns_k[n][0] for n in my_seq_range])
+				rs2 = max([abns_k[n][1] for n in my_seq_range])
+				tel_bases_in_seq = count_tel_repeat_bases_in_string(READDAT_BY_RNAME[k][rs1:rs2])
+				tel_frac         = tel_bases_in_seq/float(rs2-rs1)
+				#
+				my_case = CASE_NUMBER_DISCARD
+				if collapsed_types == ['tel', 'seq', 'sub']:
+					my_sub_range = list(range(type_ranges[2][0],type_ranges[2][1]+1))
+					sub_len_max  = max([abs(abns_k[n][3] - abns_k[n][4]) for n in my_sub_range])
+					if sub_len_max/float(seq_len_sum) >= MIN_SUB_TO_SEQ_LEN_RATIO:
+						pick_anchor_from_inds = [2]
+						get_tel_len_from_inds = [0]
+						anchor_orientation    = 'left'
+						my_case = 4
+				elif collapsed_types == ['sub', 'seq', 'tel']:
+					my_sub_range = list(range(type_ranges[0][0],type_ranges[0][1]+1))
+					sub_len_max  = max([abs(abns_k[n][3] - abns_k[n][4]) for n in my_sub_range])
+					if sub_len_max/float(seq_len_sum) >= MIN_SUB_TO_SEQ_LEN_RATIO:
+						pick_anchor_from_inds = [0]
+						get_tel_len_from_inds = [2]
+						anchor_orientation    = 'right'
+						my_case = 4
+
+			# case 5a & 5b
+			elif collapsed_types == ['seq', 'tel', 'sub'] or collapsed_types == ['sub', 'tel', 'seq']:
+				if collapsed_types == ['seq', 'tel', 'sub']:
+					my_seq_range = list(range(type_ranges[0][0],type_ranges[0][1]+1))
+					my_sub_range = list(range(type_ranges[2][0],type_ranges[2][1]+1))
+				elif collapsed_types == ['sub', 'tel', 'seq']:
+					my_seq_range = list(range(type_ranges[2][0],type_ranges[2][1]+1))
+					my_sub_range = list(range(type_ranges[0][0],type_ranges[0][1]+1))
+				seq_len_sum = sum([abs(abns_k[n][3] - abns_k[n][4]) for n in my_seq_range])
+				sub_len_max = max([abs(abns_k[n][3] - abns_k[n][4]) for n in my_sub_range])
+				#
+				my_case = CASE_NUMBER_DISCARD
+				if sub_len_max/float(seq_len_sum) >= MIN_SUB_TO_SEQ_LEN_RATIO:
+					#(rs1, rs2)      = (abns_k[my_seq_range[0]][0], abns_k[my_seq_range[-1]][1])
+					rs1 = min([abns_k[n][0] for n in my_seq_range])
+					rs2 = max([abns_k[n][1] for n in my_seq_range])
+					tel_bases_in_seq = count_tel_repeat_bases_in_string(READDAT_BY_RNAME[k][rs1:rs2])
+					tel_frac         = tel_bases_in_seq/float(rs2-rs1)
+					if collapsed_types == ['seq', 'tel', 'sub']:
+						pick_anchor_from_inds = [2]
+						get_tel_len_from_inds = [1]
+						anchor_orientation    = 'left'
+					elif collapsed_types == ['sub', 'tel', 'seq']:
+						pick_anchor_from_inds = [0]
+						get_tel_len_from_inds = [1]
+						anchor_orientation    = 'right'
+					my_case = 5
+
+			# skip: TEL ON NO FLANKS ("tel?" doesn't count here)
+			elif type_dat[0] != 'tel' and type_dat[-1] != 'tel':
+				skip_count['0_tel_flank'] += 1
+				my_case = CASE_NUMBER_DISCARD
+
+			# too hard, lets give up..
+			else:
+				my_case = CASE_NUMBER_COMPLEX
 
 		#
 		# tabulate length & determine anchor
 		#
-		my_anchor  = 'none'
+		my_anchor  = None
 		my_tel_len = 0
 		if len(get_tel_len_from_inds):
 			my_tel_range = []
 			for i in get_tel_len_from_inds:
 				my_tel_range.extend(list(range(type_ranges[i][0],type_ranges[i][1]+1)))
-			my_tel_len = 0
+			my_tel_pos_dict = {}
 			for i in my_tel_range:
-				my_tel_len += abs(abns_k[i][1] - abns_k[i][0])
-			#
+				s = sorted([abns_k[i][0], abns_k[i][1]])
+				for j in range(s[0],s[1]):
+					my_tel_pos_dict[j] = True
+			my_tel_len = len(my_tel_pos_dict)
+			if tel_bases_in_seq != None and tel_frac >= MIN_TEL_FRAC_TO_ADD_TELSEQ_BASES:
+				my_tel_len += tel_bases_in_seq
+
 			my_anc_range = []
 			for i in pick_anchor_from_inds:
 				my_anc_range.extend(list(range(type_ranges[i][0],type_ranges[i][1]+1)))
@@ -461,8 +617,16 @@ if ANCHORED_TEL_JSON == None:
 			for i in my_anc_range:
 				my_anchors.append([abs(abns_k[i][1] - abns_k[i][0]), abns_k[i][2], subtel_dat[i], i])
 			my_anchors = sorted(my_anchors, reverse=True)
+			if anchor_orientation == 'left':
+				apos = abns_k[my_anchors[0][3]][3]
+			elif anchor_orientation == 'right':
+				apos = abns_k[my_anchors[0][3]][4]
+			else:
+				print('how did you end up here??', anchor_orientation)
+				exit(1)
 
-			my_anchor = my_anchors[0][1]
+			my_anchor     = my_anchors[0][1]
+			my_anchor_pos = (my_anchor, apos)
 			if my_anchors[0][2] != None:
 				my_anchor += my_anchors[0][2][1]
 			else:
@@ -475,14 +639,28 @@ if ANCHORED_TEL_JSON == None:
 					if my_anchor not in CHR_FAILED_TO_ANCHOR:
 						CHR_FAILED_TO_ANCHOR[my_anchor] = 0
 					CHR_FAILED_TO_ANCHOR[my_anchor] += 1
-					my_anchor = 'unanchored'
+					#my_anchor = 'unanchored'
+					my_case = CASE_NUMBER_DISCARD
+					continue
 
 			if my_anchor not in ANCHORED_TEL:
 				ANCHORED_TEL[my_anchor] = []
 			ANCHORED_TEL[my_anchor].append(my_tel_len)
 
+			if my_anchor != 'unanchored':
+				if my_anchor not in ANCHORED_POS:
+					ANCHORED_POS[my_anchor] = []
+				ANCHORED_POS[my_anchor].append(my_anchor_pos[1])
+
+			if READS_ARE_PBSIM:
+				conf_key = (k.split('-')[1].replace('_',''), my_anchor)
+				if conf_key not in CONF_DAT:
+					CONF_DAT[conf_key] = 0
+				CONF_DAT[conf_key] += 1
+
 			#print(my_case, type_ranges)
 			#print(my_anchors)
+			#print(my_anchor, my_anchor_pos)
 			#print('')
 
 		#
@@ -541,10 +719,7 @@ if ANCHORED_TEL_JSON == None:
 		if plot_me == False or SKIP_READ_PLOTS:
 			continue
 
-		mpl.rcParams.update({'font.size': 18, 'font.weight':'bold'})
-
 		fig = mpl.figure(0,figsize=(12,6))
-		# <plot stuff here>
 		ax = mpl.gca()
 		for i in range(len(polygons)):
 			ax.add_collection(PatchCollection([polygons[i]], alpha=p_alpha[i], color=p_color[i]))
@@ -555,10 +730,17 @@ if ANCHORED_TEL_JSON == None:
 		mpl.yticks([],[])
 		mpl.grid(linestyle='--', alpha=0.5)
 		mpl.xlabel('read coordinates')
-		mpl.title(k + ' tel_len: ' + str(my_tel_len))
+		mpl.title(k + ' --- tel_len: ' + str(my_tel_len))
 		mpl.tight_layout()
 
-		my_plot_dir = PLOT_DIR + my_anchor + '/'
+		if my_case == CASE_NUMBER_TELONLY:
+			my_plot_dir = PLOT_DIR + 'other-unanchored/'
+		elif my_case == CASE_NUMBER_COMPLEX:
+			my_plot_dir = PLOT_DIR + 'other-complex/'
+		elif my_case == CASE_NUMBER_DISCARD:
+			my_plot_dir = PLOT_DIR + 'other-discard/'
+		else:
+			my_plot_dir = PLOT_DIR + my_anchor + '/'
 		makedir(my_plot_dir)
 		mpl.savefig(my_plot_dir + 'read_' + str(nPlot) + '.png')
 
@@ -584,6 +766,11 @@ if ANCHORED_TEL_JSON == None:
 
 else:
 	ANCHORED_TEL = ANCHORED_TEL_JSON	# skip everything, use precomputed tel lens
+
+#
+readcount_denom = max([len(ANCHORED_TEL[k]) for k in ANCHORED_TEL.keys() if k != 'unanchored'])
+width_max       = 1.0
+width_min       = 0.1
 
 #
 #	PLOT WHOLE-GENOME SUMMARY (SCATTER)
@@ -620,7 +807,6 @@ for n in ytck:
 	else:
 		ylab.append(str(abs(n)//1000) + 'k')
 
-mpl.rcParams.update({'font.size': 18, 'font.weight':'bold'})
 fig = mpl.figure(0,figsize=(16,6))
 mpl.scatter(dat_x, dat_y, s=100, c=dat_c, linewidths=0)
 mpl.plot([0,len(xlab)+1], [0,0], '-k', linewidth=3)
@@ -639,13 +825,17 @@ mpl.savefig(SUMMARY_SCATTER)
 #
 (dat_l_p, dat_l_q) = ([], [])
 (dat_p_p, dat_p_q) = ([], [])
+(dat_w_p, dat_w_q) = ([], [])
 for k in ANCHORED_TEL.keys():
+	my_width = min( [width_max, max([width_min, width_max*(float(len(ANCHORED_TEL[k]))/readcount_denom)])] )
 	if k[-1] == 'p' or k == 'unanchored':
 		dat_p_p.append(ref_2_x[k[:-1]])
 		dat_l_p.append([])
+		dat_w_p.append(my_width)
 	elif k[-1] == 'q':
 		dat_p_q.append(ref_2_x[k[:-1]])
 		dat_l_q.append([])
+		dat_w_q.append(my_width)
 	for n in ANCHORED_TEL[k]:
 		if k[-1] == 'p' or k == 'unanchored':
 			dat_l_p[-1].append(n)
@@ -655,7 +845,7 @@ for k in ANCHORED_TEL.keys():
 v_line_keys = ['cmeans', 'cmins', 'cmaxes', 'cbars', 'cmedians', 'cquantiles']
 fig = mpl.figure(1,figsize=(16,6))
 
-violin_parts_p = mpl.violinplot(dat_l_p, dat_p_p, points=200, widths=0.7)
+violin_parts_p = mpl.violinplot(dat_l_p, dat_p_p, points=200, widths=dat_w_p)
 for pc in violin_parts_p['bodies']:
 	pc.set_facecolor('blue')
 	pc.set_edgecolor('black')
@@ -665,7 +855,7 @@ for k in v_line_keys:
 		violin_parts_p[k].set_color('black')
 		violin_parts_p[k].set_alpha(0.3)
 
-violin_parts_q = mpl.violinplot(dat_l_q, dat_p_q, points=200, widths=0.7)
+violin_parts_q = mpl.violinplot(dat_l_q, dat_p_q, points=200, widths=dat_w_q)
 for pc in violin_parts_q['bodies']:
 	pc.set_facecolor('red')
 	pc.set_edgecolor('black')
@@ -674,6 +864,27 @@ for k in v_line_keys:
 	if k in violin_parts_q:
 		violin_parts_q[k].set_color('black')
 		violin_parts_q[k].set_alpha(0.3)
+
+if len(COMP_DICT) == 0:
+	for i in range(len(dat_l_p)):
+		yval = np.mean(dat_l_p[i])
+		xval = dat_p_p[i]
+		mpl.plot([xval - 0.3, xval + 0.3], [yval, yval], '-k', linewidth=2, alpha=0.4)
+	for i in range(len(dat_l_q)):
+		yval = np.mean(dat_l_q[i])
+		xval = dat_p_q[i]
+		mpl.plot([xval - 0.3, xval + 0.3], [yval, yval], '-k', linewidth=2, alpha=0.4)
+else:
+	for k in COMP_DICT.keys():
+		xval = ref_2_x[k[:-1]]
+		if k[-1] == 'p':
+			yval = COMP_DICT[k]
+		elif k[-1] == 'q':
+			yval = -COMP_DICT[k]
+		else:
+			print('skipping weird benchmark contig:', k, COMP_DICT[k])
+			continue
+		mpl.plot([xval - 0.35, xval + 0.35], [yval, yval], '-k', linewidth=3, alpha=1.0)
 
 mpl.plot([0,len(xlab)+1], [0,0], '-k', linewidth=3)
 mpl.xticks(xtck, xlab)
@@ -686,6 +897,67 @@ mpl.tight_layout()
 mpl.savefig(SUMMARY_VIOLIN)
 
 #
+#	ANCHOR POSITION PLOTS
+#
+print('plotting QC plots...')
+BP_PER_BIN = 300
+MIN_BINS   = 30
+for k in ANCHORED_POS.keys():
+	(pmin, pmax) = (min(ANCHORED_POS[k]), max(ANCHORED_POS[k]))
+	nbins = max([MIN_BINS, int((pmax - pmin)/float(BP_PER_BIN) + 0.5)])
+
+	fig = mpl.figure(2,figsize=(12,6))
+	mpl.hist(ANCHORED_POS[k], bins=nbins)
+	mpl.grid(linestyle='--', alpha=0.5)
+	mpl.ylabel('read count')
+	mpl.xlabel('position (' + k + ')')
+	mpl.tight_layout()
+	mpl.savefig(QCPLOT_DIR + k + '.png')
+	mpl.close(fig)
+
+#
+#	CONFUSION MATRIX (FOR PBSIM SIMULATED READS)
+#
+if READS_ARE_PBSIM:
+	ref_2_ci = {}
+	clab     = []
+	for ci in xlab:
+		if ci == '-':
+			ref_2_ci['-'] = 0
+			clab.append('-')
+		else:
+			ref_2_ci['chr' + ci + 'p'] = len(ref_2_ci)
+			ref_2_ci['chr' + ci + 'q'] = len(ref_2_ci)
+			clab.append('chr' + ci + 'p')
+			clab.append('chr' + ci + 'q')
+	ref_2_ci['unanchored'] = 0
+
+	# (truth, where_we_ended_up)
+	Z = [[1,2,3],[4,5,6],[7,8,9]]
+	Z = [[0 for n in range(len(ref_2_ci))] for m in range(len(ref_2_ci))]
+	for k1 in sorted(CONF_DAT.keys()):
+		#print(k1, CONF_DAT[k1], ref_2_ci[k1[0]], ref_2_ci[k1[1]])
+		Z[ref_2_ci[k1[0]]][ref_2_ci[k1[1]]] = CONF_DAT[k1]
+
+	mpl.rcParams.update({'font.size': 14, 'font.weight':'bold'})
+
+	fig = mpl.figure(3,figsize=(12,10))
+	Z = np.array(Z[::-1])
+	X, Y = np.meshgrid( range(0,len(Z[0])+1), range(0,len(Z)+1) )
+	mpl.pcolormesh(X,Y,Z)
+	mpl.axis([0,len(Z[0]),0,len(Z)])
+	mpl.yticks(np.arange(0,len(clab))+1.5, clab[::-1])
+	mpl.xticks(np.arange(0,len(clab))+0.5, clab, rotation=90)
+	mpl.grid(linestyle='--', alpha=0.5)
+	mpl.title('subtel confusion matrix')
+	mpl.ylabel('ground truth contig')
+	mpl.xlabel('where we ended up')
+	cb = mpl.colorbar()
+	cb.set_label('# reads')
+	mpl.tight_layout()
+	mpl.savefig(CONFUSION_PLOT)
+
+#
 #	PRINT OUTPUT STATS AND ETC
 #
 if USE_JSON == False:
@@ -694,7 +966,8 @@ if USE_JSON == False:
 	
 	print('')
 	for k in sorted(ANCHORED_TEL.keys()):
-		print(k, ANCHORED_TEL[k])
+		#print(k, ANCHORED_TEL[k])
+		print(k, int(np.mean(ANCHORED_TEL[k])), int(np.median(ANCHORED_TEL[k])))
 	print('')
 	
 	print('CASE TYPES:')
