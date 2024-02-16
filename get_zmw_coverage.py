@@ -75,9 +75,9 @@ def reads_2_cov(my_chr, readpos_list_all, out_dir, CONTIG_SIZES, WINDOW_SIZE, be
     # downsample
     out_cov = []
     for i in range(0,len(cov),WINDOW_SIZE):
-        out_cov.append(int(np.mean(cov[i:i+WINDOW_SIZE])+0.5))
+        out_cov.append(np.mean(cov[i:i+WINDOW_SIZE]))
     old_cov = cov
-    cov = np.array(out_cov, dtype='<i4')
+    cov = np.array(out_cov)
 
     # write output
     if out_dir[-1] != '/':
