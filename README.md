@@ -1,4 +1,4 @@
-# pacbio_tools
+# pacbio-tools
 Various scripts and workflows for processing PacBio data. Written in Python3.
 
 ## filter_homopolymer_indels.py
@@ -18,5 +18,5 @@ python3 setup.py build_ext --inplace
 Computes ZMW coverage depth from a BAM file.
 
 ```
-samtools view input.bam | python3 get_zmw_coverage.py <args>
+python3 get_zmw_coverage.py -i input.bam -m CCS -o out/
 ```
