@@ -76,6 +76,7 @@ def reads_2_cov(my_chr, readpos_list_all, out_dir, CONTIG_SIZES, WINDOW_SIZE, be
     out_cov = []
     for i in range(0,len(cov),WINDOW_SIZE):
         out_cov.append(int(np.mean(cov[i:i+WINDOW_SIZE])+0.5))
+    old_cov = cov
     cov = np.array(out_cov, dtype='<i4')
 
     # write output
@@ -98,9 +99,9 @@ def reads_2_cov(my_chr, readpos_list_all, out_dir, CONTIG_SIZES, WINDOW_SIZE, be
         mpl.show()
 
     # stats
-    total_bases = np.sum(cov)
+    total_bases = np.sum(old_cov)
     avg_cov     = total_bases/float(denom)
-    total_unmap = len(cov) - np.count_nonzero(cov) - oob_pos
+    total_unmap = len(old_cov) - np.count_nonzero(old_cov) - oob_pos
     avg_unmap   = total_unmap/float(denom)
     print('mean cov depth:        ', '{0:0.3f}'.format(avg_cov))
     print('frac uncovered pos:  ', '{0:0.3f}'.format(avg_unmap))
