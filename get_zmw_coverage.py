@@ -27,7 +27,7 @@ def is_valid_coord(my_chr, my_pos, bed_list=[]):
 #
 # returns (total_bases_mapped, avg_cov, total_uncov_pos, fraction_uncov_pos, nonexcluded_pos)
 #
-def reads_2_cov(my_chr, readpos_list_all, out_dir, CONTIG_SIZES, bed_list=[], plot_list=[]):
+def reads_2_cov(my_chr, readpos_list_all, out_dir, CONTIG_SIZES, WINDOW_SIZE, bed_list=[], plot_list=[]):
     if my_chr not in CONTIG_SIZES:
         print('skipping '+my_chr+'...')
         return None
@@ -40,8 +40,8 @@ def reads_2_cov(my_chr, readpos_list_all, out_dir, CONTIG_SIZES, bed_list=[], pl
                 denom   -= track[j+1]-track[j]
                 oob_pos += track[j+1]-track[j]
             #print(CONTIG_SIZES[my_chr], '-->', denom)
-    #cov = np.zeros(CONTIG_SIZES[my_chr] , dtype='<B')
-    cov = np.zeros(CONTIG_SIZES[my_chr] , dtype='<i4')
+    #cov = np.zeros(CONTIG_SIZES[my_chr], dtype='<B')
+    cov = np.zeros(CONTIG_SIZES[my_chr], dtype='<i4')
 
     readlens = []
     print('computing zmw coverage on '+my_chr+'...')
@@ -71,11 +71,17 @@ def reads_2_cov(my_chr, readpos_list_all, out_dir, CONTIG_SIZES, bed_list=[], pl
         #print(len(readpos_list), readpos_list)
         for rspan in readpos_list:
             cov[rspan[0]:rspan[1]] += 1
-    
+
+    # downsample
+    out_cov = []
+    for i in range(0,len(cov),WINDOW_SIZE):
+        out_cov.append(int(np.mean(cov[i:i+WINDOW_SIZE])+0.5))
+    cov = np.array(out_cov, dtype='<i4')
+
     # write output
     if out_dir[-1] != '/':
         out_dir += '/'
-    out_fn   = 'zmw-coverage_' + my_chr
+    out_fn   = 'coverage_w' + str(WINDOW_SIZE) + '_' + my_chr
     out_file = out_dir + out_fn + '.npz'
     #cov.tofile(out_file)   # takes up too much space
     print('saving ' + out_fn + '.npz...')
@@ -87,7 +93,7 @@ def reads_2_cov(my_chr, readpos_list_all, out_dir, CONTIG_SIZES, bed_list=[], pl
         y = cov[plot_list[i][0]:plot_list[i][1]]
         mpl.figure(i)
         mpl.plot(x,y)
-        mpl.ylabel('ZMW coverage')
+        mpl.ylabel('coverage depth')
         mpl.title(my_chr + ' : ' + str(plot_list[i][0]) + ' - ' + str(plot_list[i][1]))
         mpl.show()
 
@@ -96,7 +102,7 @@ def reads_2_cov(my_chr, readpos_list_all, out_dir, CONTIG_SIZES, bed_list=[], pl
     avg_cov     = total_bases/float(denom)
     total_unmap = len(cov) - np.count_nonzero(cov) - oob_pos
     avg_unmap   = total_unmap/float(denom)
-    print('mean zmw cov:        ', '{0:0.3f}'.format(avg_cov))
+    print('mean cov depth:        ', '{0:0.3f}'.format(avg_cov))
     print('frac uncovered pos:  ', '{0:0.3f}'.format(avg_unmap))
     print('mean aligned readlen:', int(np.mean(readlens)))
     return (total_bases, avg_cov, total_unmap, avg_unmap, denom)
@@ -112,6 +118,7 @@ def main(raw_args=None):
     parser.add_argument('-p',  type=str, required=False, metavar='<str>', help="plot_regions.bed",                     default=None)
     parser.add_argument('-q',  type=int, required=False, metavar='<int>', help="minimum MAPQ",                         default=0)
     parser.add_argument('-r',  type=str, required=False, metavar='<str>', help="refname (hg38, hg19, t2t, telogator)", default='hg38')
+    parser.add_argument('-w',  type=int, required=False, metavar='<int>', help="window size for output data",          default=10000)
     parser.add_argument('-bd', type=str, required=False, metavar='<str>', help="/path/to/bed/dir/",                    default=None)
     args = parser.parse_args()
 
@@ -128,7 +135,8 @@ def main(raw_args=None):
     makedir(OUT_PATH)
     OUT_REPORT = OUT_PATH+'cov_report.tsv'
 
-    MIN_MAPQ = max([0,args.q])
+    MIN_MAPQ = max(0,args.q)
+    WINDOW_SIZE = max(1,args.w)
 
     REF_VERS = args.r
     if REF_VERS not in REFFILE_NAMES:
@@ -139,7 +147,7 @@ def main(raw_args=None):
     print('Using contig sizes:', REF_VERS)
 
     RESOURCE_PATH = args.bd
-    if RESOURCE_PATH == None:
+    if RESOURCE_PATH is None:
         SIM_PATH = '/'.join(os.path.realpath(__file__).split('/')[:-1]) + '/'
         RESOURCE_PATH = SIM_PATH + 'resources/'
     if RESOURCE_PATH[-1] != '/':
@@ -159,7 +167,7 @@ def main(raw_args=None):
 
     PLOT_BED_NAME = args.p
     PLOT_BED_DICT = {}
-    if PLOT_BED_NAME != None:
+    if PLOT_BED_NAME is not None:
         f = open(PLOT_BED_NAME, 'r')
         for line in f:
             splt = line.strip().split('\t')
@@ -182,10 +190,8 @@ def main(raw_args=None):
     #
     for aln in samfile.fetch(until_eof=True):
         splt = str(aln).split('\t')
-        my_ref_ind  = splt[2].replace('#','')   # why would there ever be a # symbol here? I don't know.
-        # pysam is dumb and prints ref indices instead of contig name
-        # - except unmapped, which is '*'
-        # - and I've also seen it spit out '-1' ...
+        my_ref_ind  = splt[2].replace('#','')
+        # pysam weirdness
         if my_ref_ind.isdigit():
             splt[2] = refseqs[int(my_ref_ind)]
         elif my_ref_ind == '-1':
@@ -217,11 +223,11 @@ def main(raw_args=None):
 
         if ref != prev_ref:
             # compute coverage on previous ref now that we're done
-            if prev_ref != None and len(alns_by_zmw) and prev_ref in CONTIG_SIZES:
+            if prev_ref is not None and len(alns_by_zmw) and prev_ref in CONTIG_SIZES:
                 plot_regions = []
                 if prev_ref in PLOT_BED_DICT:
                     plot_regions = PLOT_BED_DICT[prev_ref]
-                covdat_by_ref[prev_ref] = reads_2_cov(prev_ref, alns_by_zmw, OUT_PATH, CONTIG_SIZES, bed_list=EXCL_BED, plot_list=plot_regions)
+                covdat_by_ref[prev_ref] = reads_2_cov(prev_ref, alns_by_zmw, OUT_PATH, CONTIG_SIZES, WINDOW_SIZE, bed_list=EXCL_BED, plot_list=plot_regions)
             # reset for next ref
             if ref in CONTIG_SIZES:
                 print('processing reads on '+ref+'...')
@@ -242,7 +248,7 @@ def main(raw_args=None):
                 adj += numbers[i]
 
         # skip telomeres + centromeres + gaps
-        if is_valid_coord(ref,pos,EXCL_BED) == False or is_valid_coord(ref,pos+adj,EXCL_BED) == False:
+        if is_valid_coord(ref,pos,EXCL_BED) is False or is_valid_coord(ref,pos+adj,EXCL_BED) is False:
             continue
 
         if rnm in rnm_dict:
@@ -262,14 +268,14 @@ def main(raw_args=None):
         plot_regions = []
         if ref in PLOT_BED_DICT:
             plot_regions = PLOT_BED_DICT[ref]
-        covdat_by_ref[ref] = reads_2_cov(ref, alns_by_zmw, OUT_PATH, CONTIG_SIZES, bed_list=EXCL_BED, plot_list=plot_regions)
+        covdat_by_ref[ref] = reads_2_cov(ref, alns_by_zmw, OUT_PATH, CONTIG_SIZES, WINDOW_SIZE, bed_list=EXCL_BED, plot_list=plot_regions)
 
     # sum up data across chromosomes to get whole-genome stats
     all_mapped_bases = 0
     all_uncovered    = 0
     all_denom        = 0
     for k in covdat_by_ref.keys():
-        if k != None:
+        if k is not None:
             all_mapped_bases += covdat_by_ref[k][0]
             all_uncovered    += covdat_by_ref[k][2]
             all_denom        += covdat_by_ref[k][4]
@@ -300,6 +306,7 @@ def main(raw_args=None):
     if 'chrM' in covdat_by_ref and 'chr2' in covdat_by_ref:
         print('chrM:chr2 mapped bases:', '{0:0.3f}'.format(covdat_by_ref['chrM'][0]/float(covdat_by_ref['chr2'][0])))
     print('')
+
 
 if __name__ == '__main__':
     main()
