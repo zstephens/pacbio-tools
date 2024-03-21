@@ -69,7 +69,7 @@ def reads_2_cov(my_chr, readpos_list_all, out_dir, CONTIG_SIZES, WINDOW_SIZE):
 def main(raw_args=None):
     parser = argparse.ArgumentParser(description='plot_coverage.py')
     parser.add_argument('-i',  type=str, required=True,  metavar='<str>', help="* input.bam")
-    parser.add_argument('-o',  type=str, required=True,  metavar='<str>', help="* /path/to/output/dir/")
+    parser.add_argument('-o',  type=str, required=True,  metavar='<str>', help="* output_dir/")
     parser.add_argument('-r',  type=str, required=False, metavar='<str>', help="refname: hg38/hg19/t2t/telogator)", default='hg38')
     parser.add_argument('-q',  type=int, required=False, metavar='<int>', help="minimum MAPQ",                      default=0)
     parser.add_argument('-w',  type=int, required=False, metavar='<int>', help="window size for downsampling",      default=10000)
@@ -100,7 +100,7 @@ def main(raw_args=None):
     CONTIG_SIZES = REFFILE_NAMES[REF_VERS]
 
     sim_path = str(pathlib.Path(__file__).resolve().parent)
-    resource_dir = sim_path + 'resources/'
+    resource_dir = sim_path + '/resources/'
     CYTOBAND_BED = resource_dir + f'{REF_VERS}-cytoband.bed'
     beddat_by_chr = {}
     with open(CYTOBAND_BED,'r') as f:
