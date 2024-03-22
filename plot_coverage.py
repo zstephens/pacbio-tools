@@ -193,10 +193,13 @@ def main(raw_args=None):
 
         # save output
         sorted_chr = [n[1] for n in sorted([(LEXICO_2_IND[k],k) for k in covdat_by_ref.keys()])]
-        np.savez_compressed(OUT_NPZ, sorted_chr=sorted_chr, **covdat_by_ref)
+        np.savez_compressed(OUT_NPZ, window_size=WINDOW_SIZE, sorted_chr=sorted_chr, **covdat_by_ref)
     #
     elif IN_BAM[-4:].lower() == '.npz':
+        print('reading from an existing npz archive instead of bam...')
         in_npz = np.load(IN_BAM)
+        WINDOW_SIZE = in_npz['window_size']
+        print(f' - ignoring -w and instead using: {WINDOW_SIZE}')
         sorted_chr = in_npz['sorted_chr']
         covdat_by_ref = {k:in_npz[k] for k in sorted_chr}
     #
