@@ -70,10 +70,10 @@ def main(raw_args=None):
     parser = argparse.ArgumentParser(description='plot_coverage.py')
     parser.add_argument('-i',  type=str, required=True,  metavar='<str>', help="* input.bam")
     parser.add_argument('-o',  type=str, required=True,  metavar='<str>', help="* output_dir/")
-    parser.add_argument('-r',  type=str, required=False, metavar='<str>', help="refname: hg38/hg19/t2t/telogator)", default='hg38')
+    parser.add_argument('-r',  type=str, required=True,  metavar='<str>', help="refname: hg38 / hg19 / t2t")
     parser.add_argument('-q',  type=int, required=False, metavar='<int>', help="minimum MAPQ",                      default=0)
     parser.add_argument('-w',  type=int, required=False, metavar='<int>', help="window size for downsampling",      default=10000)
-    parser.add_argument('-rt', type=str, required=False, metavar='<str>', help="read type: CCS/CLR/ONT",            default='CCS')
+    parser.add_argument('-rt', type=str, required=False, metavar='<str>', help="read type: CCS / CLR / ONT",            default='CCS')
     args = parser.parse_args()
 
     IN_BAM = args.i
@@ -94,7 +94,7 @@ def main(raw_args=None):
 
     REF_VERS = args.r
     if REF_VERS not in REFFILE_NAMES:
-        print('Error: Refname (-r) must be one of the following:')
+        print('Error: -r must be one of the following:')
         print(sorted(REFFILE_NAMES.keys()))
         exit(1)
     CONTIG_SIZES = REFFILE_NAMES[REF_VERS]
