@@ -208,9 +208,9 @@ def main(raw_args=None):
     elif IN_BAM[-4:].lower() == '.npz':
         print('reading from an existing npz archive instead of bam...')
         in_npz = np.load(IN_BAM)
-        REF_VERS = in_npz['ref_vers']
-        WINDOW_SIZE = in_npz['window_size']
-        sorted_chr = in_npz['sorted_chr']
+        REF_VERS = str(in_npz['ref_vers'])
+        WINDOW_SIZE = int(in_npz['window_size'])
+        sorted_chr = in_npz['sorted_chr'].tolist()
         covdat_by_ref = {k:in_npz[k] for k in sorted_chr}
         print(f' - ignoring -r and instead using: {REF_VERS}')
         print(f' - ignoring -w and instead using: {WINDOW_SIZE}')
