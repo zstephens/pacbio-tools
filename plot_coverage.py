@@ -8,6 +8,10 @@ import re
 import sys
 import time
 
+from matplotlib import gridspec
+from matplotlib.patches import Polygon
+from matplotlib.collections import PatchCollection
+
 from common.ref_func_corgi import HG38_SIZES, HG19_SIZES, T2T11_SIZES, TELOGATOR_SIZES, LEXICO_2_IND, makedir
 
 REF_CHAR = 'MX=D'
@@ -25,6 +29,7 @@ CYTOBAND_COLORS = {'gneg':(255,255,255),
                    'acen':(139,112,144),
                    'stalk':(139,112,144),
                    'gvar':(231,214,234)}
+CYTOBAND_COLORS = {k:(v[0]/255.,v[1]/255.,v[2]/255.) for k,v in CYTOBAND_COLORS.items()}
 
 
 def strip_polymerase_coords(rn):
@@ -72,10 +77,10 @@ def main(raw_args=None):
     parser = argparse.ArgumentParser(description='plot_coverage.py')
     parser.add_argument('-i',  type=str, required=True,  metavar='<str>', help="* input.bam")
     parser.add_argument('-o',  type=str, required=True,  metavar='<str>', help="* output_dir/")
-    parser.add_argument('-r',  type=str, required=True,  metavar='<str>', help="refname: hg38 / hg19 / t2t")
-    parser.add_argument('-q',  type=int, required=False, metavar='<int>', help="minimum MAPQ",                      default=0)
-    parser.add_argument('-w',  type=int, required=False, metavar='<int>', help="window size for downsampling",      default=10000)
-    parser.add_argument('-rt', type=str, required=False, metavar='<str>', help="read type: CCS / CLR / ONT",            default='CCS')
+    parser.add_argument('-r',  type=str, required=False, metavar='<str>', help="refname: hg38 / hg19 / t2t",   default='t2t')
+    parser.add_argument('-q',  type=int, required=False, metavar='<int>', help="minimum MAPQ",                 default=0)
+    parser.add_argument('-w',  type=int, required=False, metavar='<int>', help="window size for downsampling", default=10000)
+    parser.add_argument('-rt', type=str, required=False, metavar='<str>', help="read type: CCS / CLR / ONT",   default='CCS')
     args = parser.parse_args()
 
     IN_BAM = args.i
@@ -99,13 +104,13 @@ def main(raw_args=None):
     sim_path = str(pathlib.Path(__file__).resolve().parent)
     resource_dir = sim_path + '/resources/'
     CYTOBAND_BED = resource_dir + f'{REF_VERS}-cytoband.bed'
-    beddat_by_chr = {}
+    cyto_by_chr = {}
     with open(CYTOBAND_BED,'r') as f:
         for line in f:
             splt = line.strip().split('\t')
-            if splt[0] not in beddat_by_chr:
-                beddat_by_chr[splt[0]] = []
-            beddat_by_chr[splt[0]].append((int(splt[1]), int(splt[2]), splt[3], splt[4]))
+            if splt[0] not in cyto_by_chr:
+                cyto_by_chr[splt[0]] = []
+            cyto_by_chr[splt[0]].append((int(splt[1]), int(splt[2]), splt[3], splt[4]))
 
     prev_ref = None
     rnm_dict = {}
@@ -121,6 +126,7 @@ def main(raw_args=None):
             print(sorted(REFFILE_NAMES.keys()))
             exit(1)
         CONTIG_SIZES = REFFILE_NAMES[REF_VERS]
+        print(f'using reference: {REF_VERS}')
         #
         samfile = pysam.AlignmentFile(IN_BAM, "rb")
         refseqs = samfile.references
@@ -220,7 +226,61 @@ def main(raw_args=None):
         print('Error: -i must be .bam or .npz')
         exit(1)
 
-    print(sorted_chr)
+    #
+    sys.stdout.write('making plots...')
+    sys.stdout.flush()
+    tt = time.perf_counter()
+    for my_chr in sorted_chr:
+        fig = mpl.figure(1, figsize=(12,4), dpi=200)
+        gs = gridspec.GridSpec(2, 1, height_ratios=[8,1])
+        ax1 = mpl.subplot(gs[0])
+        xt = np.arange(0,CONTIG_SIZES[my_chr],10000000)
+        xl = [f'{n*10}M' for n in range(len(xt))]
+        with np.errstate(divide='ignore'):
+            cy = np.log2(covdat_by_ref[my_chr])
+        cx = np.array([n*WINDOW_SIZE + WINDOW_SIZE/2 for n in range(len(cy))])
+        mpl.scatter(cx, cy, s=1, c='black')
+        mpl.xlim(0,CONTIG_SIZES[my_chr])
+        mpl.ylim(bottom=0)
+        mpl.xticks(xt,xl)
+        mpl.grid(which='both', linestyle='--', alpha=0.6)
+        for tick in ax1.xaxis.get_major_ticks():
+            tick.tick1line.set_visible(False)
+            tick.tick2line.set_visible(False)
+            tick.label1.set_visible(False)
+            tick.label2.set_visible(False)
+        #
+        ax2 = mpl.subplot(gs[1])
+        if my_chr in cyto_by_chr:
+            polygons = []
+            p_color  = []
+            p_alpha  = []
+            for cdat in cyto_by_chr[my_chr]:
+                pq = cdat[2][0]
+                my_type = cdat[3]
+                xp = [cdat[0], cdat[1]]
+                yp = [-1, 1]
+                if my_type == 'acen':
+                    if pq == 'p':
+                        polygons.append(Polygon(np.array([[xp[0],yp[0]], [xp[0],yp[1]], [xp[1],0]]), closed=True))
+                    else:
+                        polygons.append(Polygon(np.array([[xp[0],0], [xp[1],yp[1]], [xp[1],yp[0]]]), closed=True))
+                else:
+                    polygons.append(Polygon(np.array([[xp[0],yp[0]], [xp[0],yp[1]], [xp[1],yp[1]], [xp[1],yp[0]]]), closed=True))
+                p_color.append(CYTOBAND_COLORS[my_type])
+                p_alpha.append(0.8)
+            for j in range(len(polygons)):
+                ax2.add_collection(PatchCollection([polygons[j]], color=p_color[j], alpha=p_alpha[j], linewidth=0))
+        mpl.xticks(xt,xl,rotation=70)
+        mpl.yticks([],[])
+        mpl.xlim(0,CONTIG_SIZES[my_chr])
+        mpl.ylim(-1,1)
+        #
+        mpl.tight_layout()
+        mpl.savefig(f'{OUT_DIR}cov_{my_chr}.png')
+        mpl.close(fig)
+    sys.stdout.write(f' ({int(time.perf_counter() - tt)} sec)\n')
+    sys.stdout.flush()
 
 
 if __name__ == '__main__':
