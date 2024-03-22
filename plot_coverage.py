@@ -5,6 +5,8 @@ import matplotlib.pyplot as mpl
 import pathlib
 import pysam
 import re
+import sys
+import time
 
 from common.ref_func_corgi import HG38_SIZES, HG19_SIZES, T2T11_SIZES, TELOGATOR_SIZES, LEXICO_2_IND, makedir
 
@@ -32,10 +34,10 @@ def strip_polymerase_coords(rn):
 def reads_2_cov(my_chr, readpos_list_all, out_dir, CONTIG_SIZES, WINDOW_SIZE):
     #
     if my_chr not in CONTIG_SIZES:
-        print('skipping coverage computation for '+my_chr+'...')
+        print(' - skipping coverage computation for '+my_chr+'...')
         return None
     #
-    print('computing coverage on '+my_chr+'...')
+    #print(' - computing coverage on '+my_chr+'...')
     cov = np.zeros(CONTIG_SIZES[my_chr], dtype='<i4')
     # collapse overlapping alignments
     for readpos_list in readpos_list_all:
@@ -93,11 +95,6 @@ def main(raw_args=None):
     WINDOW_SIZE = max(1,args.w)
 
     REF_VERS = args.r
-    if REF_VERS not in REFFILE_NAMES:
-        print('Error: -r must be one of the following:')
-        print(sorted(REFFILE_NAMES.keys()))
-        exit(1)
-    CONTIG_SIZES = REFFILE_NAMES[REF_VERS]
 
     sim_path = str(pathlib.Path(__file__).resolve().parent)
     resource_dir = sim_path + '/resources/'
@@ -115,8 +112,15 @@ def main(raw_args=None):
     alns_by_zmw = []    # alignment start/end per zmw
     rlen_by_zmw = []    # max tlen observed for each zmw
     covdat_by_ref = {}  #
+    tt = time.perf_counter()
 
     if IN_BAM[-4:].lower() == '.bam':
+        #
+        if REF_VERS not in REFFILE_NAMES:
+            print('Error: -r must be one of the following:')
+            print(sorted(REFFILE_NAMES.keys()))
+            exit(1)
+        CONTIG_SIZES = REFFILE_NAMES[REF_VERS]
         #
         samfile = pysam.AlignmentFile(IN_BAM, "rb")
         refseqs = samfile.references
@@ -156,9 +160,13 @@ def main(raw_args=None):
                 # compute coverage on previous ref now that we're done
                 if prev_ref is not None and len(alns_by_zmw) and prev_ref in CONTIG_SIZES:
                     covdat_by_ref[prev_ref] = reads_2_cov(prev_ref, alns_by_zmw, OUT_DIR, CONTIG_SIZES, WINDOW_SIZE)
+                    sys.stdout.write(f' ({int(time.perf_counter() - tt)} sec)\n')
+                    sys.stdout.flush()
                 # reset for next ref
                 if ref in CONTIG_SIZES:
-                    print('processing reads on '+ref+'...')
+                    sys.stdout.write(f'processing reads on {ref}...')
+                    sys.stdout.flush()
+                    tt = time.perf_counter()
                 else:
                     print('skipping reads on '+ref+'...')
                 alns_by_zmw = []
@@ -190,18 +198,23 @@ def main(raw_args=None):
         # we probably we need to process the final ref, assuming no contigs beyond chrM
         if ref not in covdat_by_ref and len(alns_by_zmw) and ref in CONTIG_SIZES:
             covdat_by_ref[ref] = reads_2_cov(ref, alns_by_zmw, OUT_DIR, CONTIG_SIZES, WINDOW_SIZE)
+            sys.stdout.write(f' ({int(time.perf_counter() - tt)} sec)\n')
+            sys.stdout.flush()
 
         # save output
         sorted_chr = [n[1] for n in sorted([(LEXICO_2_IND[k],k) for k in covdat_by_ref.keys()])]
-        np.savez_compressed(OUT_NPZ, window_size=WINDOW_SIZE, sorted_chr=sorted_chr, **covdat_by_ref)
+        np.savez_compressed(OUT_NPZ, ref_vers=REF_VERS, window_size=WINDOW_SIZE, sorted_chr=sorted_chr, **covdat_by_ref)
     #
     elif IN_BAM[-4:].lower() == '.npz':
         print('reading from an existing npz archive instead of bam...')
         in_npz = np.load(IN_BAM)
+        REF_VERS = in_npz['ref_vers']
         WINDOW_SIZE = in_npz['window_size']
-        print(f' - ignoring -w and instead using: {WINDOW_SIZE}')
         sorted_chr = in_npz['sorted_chr']
         covdat_by_ref = {k:in_npz[k] for k in sorted_chr}
+        print(f' - ignoring -r and instead using: {REF_VERS}')
+        print(f' - ignoring -w and instead using: {WINDOW_SIZE}')
+        CONTIG_SIZES = REFFILE_NAMES[REF_VERS]
     #
     else:
         print('Error: -i must be .bam or .npz')
