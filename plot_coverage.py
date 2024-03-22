@@ -116,83 +116,95 @@ def main(raw_args=None):
     rlen_by_zmw = []    # max tlen observed for each zmw
     covdat_by_ref = {}  #
 
-    samfile = pysam.AlignmentFile(IN_BAM, "rb")
-    refseqs = samfile.references
-    #
-    for aln in samfile.fetch(until_eof=True):
-        splt = str(aln).split('\t')
-        my_ref_ind  = splt[2].replace('#','')
-        # pysam weirdness
-        if my_ref_ind.isdigit():
-            splt[2] = refseqs[int(my_ref_ind)]
-        elif my_ref_ind == '-1':
-            splt[2] = refseqs[-1]
-        else:
-            splt[2] = my_ref_ind
+    if IN_BAM[-4:].lower() == '.bam':
         #
-        ref   = splt[2]
-        pos   = int(splt[3])
-        mapq  = int(splt[4])
-        cigar = splt[5]
-
-        if ref == '*':      # skip unmapped reads
-            continue
-        if mapq < MIN_MAPQ:
-            continue
-        #if pos > 1000000:  # for debugging purposes
-        #   continue
-
-        if READ_MODE == 'CLR':
-            rnm = strip_polymerase_coords(splt[0])
-            template_len = splt[0].split('/')[-1].split('_')
-            template_len = int(template_len[1]) - int(template_len[0])
-        elif READ_MODE in ['CCS', 'ONT']:
-            rnm = splt[0]
-            template_len = len(splt[9])
-
-        if ref != prev_ref:
-            # compute coverage on previous ref now that we're done
-            if prev_ref is not None and len(alns_by_zmw) and prev_ref in CONTIG_SIZES:
-                covdat_by_ref[prev_ref] = reads_2_cov(prev_ref, alns_by_zmw, OUT_DIR, CONTIG_SIZES, WINDOW_SIZE)
-            # reset for next ref
-            if ref in CONTIG_SIZES:
-                print('processing reads on '+ref+'...')
+        samfile = pysam.AlignmentFile(IN_BAM, "rb")
+        refseqs = samfile.references
+        #
+        for aln in samfile.fetch(until_eof=True):
+            splt = str(aln).split('\t')
+            my_ref_ind  = splt[2].replace('#','')
+            # pysam weirdness
+            if my_ref_ind.isdigit():
+                splt[2] = refseqs[int(my_ref_ind)]
+            elif my_ref_ind == '-1':
+                splt[2] = refseqs[-1]
             else:
-                print('skipping reads on '+ref+'...')
-            alns_by_zmw = []
-            rnm_dict = {}
-            prev_ref = ref
+                splt[2] = my_ref_ind
+            #
+            ref   = splt[2]
+            pos   = int(splt[3])
+            mapq  = int(splt[4])
+            cigar = splt[5]
 
-        if ref not in CONTIG_SIZES:
-            continue
+            if ref == '*':      # skip unmapped reads
+                continue
+            if mapq < MIN_MAPQ:
+                continue
+            #if pos > 1000000:  # for debugging purposes
+            #   continue
 
-        letters = re.split(r"\d+",cigar)[1:]
-        numbers = [int(n) for n in re.findall(r"\d+",cigar)]
-        adj     = 0
-        for i in range(len(letters)):
-            if letters[i] in REF_CHAR:
-                adj += numbers[i]
+            if READ_MODE == 'CLR':
+                rnm = strip_polymerase_coords(splt[0])
+                template_len = splt[0].split('/')[-1].split('_')
+                template_len = int(template_len[1]) - int(template_len[0])
+            elif READ_MODE in ['CCS', 'ONT']:
+                rnm = splt[0]
+                template_len = len(splt[9])
 
-        if rnm in rnm_dict:
-            my_rind = rnm_dict[rnm]
-        else:
-            rnm_dict[rnm] = len(rnm_dict)
-            my_rind       = len(rnm_dict)-1
-            alns_by_zmw.append([])
-            rlen_by_zmw.append(0)
+            if ref != prev_ref:
+                # compute coverage on previous ref now that we're done
+                if prev_ref is not None and len(alns_by_zmw) and prev_ref in CONTIG_SIZES:
+                    covdat_by_ref[prev_ref] = reads_2_cov(prev_ref, alns_by_zmw, OUT_DIR, CONTIG_SIZES, WINDOW_SIZE)
+                # reset for next ref
+                if ref in CONTIG_SIZES:
+                    print('processing reads on '+ref+'...')
+                else:
+                    print('skipping reads on '+ref+'...')
+                alns_by_zmw = []
+                rnm_dict = {}
+                prev_ref = ref
 
-        alns_by_zmw[my_rind].append((pos, pos+adj))
-        rlen_by_zmw[my_rind] = max([rlen_by_zmw[my_rind], template_len])
-    samfile.close()
+            if ref not in CONTIG_SIZES:
+                continue
 
-    # we probably we need to process the final ref, assuming no contigs beyond chrM
-    if ref not in covdat_by_ref and len(alns_by_zmw) and ref in CONTIG_SIZES:
-        covdat_by_ref[ref] = reads_2_cov(ref, alns_by_zmw, OUT_DIR, CONTIG_SIZES, WINDOW_SIZE)
+            letters = re.split(r"\d+",cigar)[1:]
+            numbers = [int(n) for n in re.findall(r"\d+",cigar)]
+            adj     = 0
+            for i in range(len(letters)):
+                if letters[i] in REF_CHAR:
+                    adj += numbers[i]
 
-    # save output
-    sk = [n[1] for n in sorted([(LEXICO_2_IND[k],k) for k in covdat_by_ref.keys()])]
-    out_cov = [covdat_by_ref[k] for k in sk]
-    np.savez_compressed(OUT_NPZ, sk, *out_cov)
+            if rnm in rnm_dict:
+                my_rind = rnm_dict[rnm]
+            else:
+                rnm_dict[rnm] = len(rnm_dict)
+                my_rind       = len(rnm_dict)-1
+                alns_by_zmw.append([])
+                rlen_by_zmw.append(0)
+
+            alns_by_zmw[my_rind].append((pos, pos+adj))
+            rlen_by_zmw[my_rind] = max([rlen_by_zmw[my_rind], template_len])
+        samfile.close()
+
+        # we probably we need to process the final ref, assuming no contigs beyond chrM
+        if ref not in covdat_by_ref and len(alns_by_zmw) and ref in CONTIG_SIZES:
+            covdat_by_ref[ref] = reads_2_cov(ref, alns_by_zmw, OUT_DIR, CONTIG_SIZES, WINDOW_SIZE)
+
+        # save output
+        sorted_chr = [n[1] for n in sorted([(LEXICO_2_IND[k],k) for k in covdat_by_ref.keys()])]
+        np.savez_compressed(OUT_NPZ, sorted_chr=sorted_chr, **covdat_by_ref)
+    #
+    elif IN_BAM[-4:].lower() == '.npz':
+        in_npz = np.load(IN_BAM)
+        sorted_chr = in_npz['sorted_chr']
+        covdat_by_ref = {k:in_npz[k] for k in sorted_chr}
+    #
+    else:
+        print('Error: -i must be .bam or .npz')
+        exit(1)
+
+    print(sorted_chr)
 
 
 if __name__ == '__main__':
