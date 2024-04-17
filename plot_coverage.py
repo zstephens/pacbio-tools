@@ -77,7 +77,7 @@ def main(raw_args=None):
     parser = argparse.ArgumentParser(description='plot_coverage.py')
     parser.add_argument('-i',  type=str, required=True,  metavar='<str>', help="* input.bam")
     parser.add_argument('-o',  type=str, required=True,  metavar='<str>', help="* output_dir/")
-    parser.add_argument('-r',  type=str, required=False, metavar='<str>', help="refname: hg38 / hg19 / t2t",   default='t2t')
+    parser.add_argument('-r',  type=str, required=False, metavar='<str>', help="refname: t2t / hg38 / hg19",   default='t2t')
     parser.add_argument('-q',  type=int, required=False, metavar='<int>', help="minimum MAPQ",                 default=0)
     parser.add_argument('-w',  type=int, required=False, metavar='<int>', help="window size for downsampling", default=10000)
     parser.add_argument('-rt', type=str, required=False, metavar='<str>', help="read type: CCS / CLR / ONT",   default='CCS')
@@ -230,6 +230,14 @@ def main(raw_args=None):
     sys.stdout.write('making plots...')
     sys.stdout.flush()
     tt = time.perf_counter()
+    #
+    all_win = []
+    for my_chr in sorted_chr:
+        cy = covdat_by_ref[my_chr]
+        all_win.extend(np.log2(cy[cy > 0.0001]).tolist())
+    avg_log2 = np.mean(all_win)
+    del all_win
+    #
     for my_chr in sorted_chr:
         fig = mpl.figure(1, figsize=(12,4), dpi=200)
         gs = gridspec.GridSpec(2, 1, height_ratios=[8,1])
@@ -237,11 +245,11 @@ def main(raw_args=None):
         xt = np.arange(0,CONTIG_SIZES[my_chr],10000000)
         xl = [f'{n*10}M' for n in range(len(xt))]
         with np.errstate(divide='ignore'):
-            cy = np.log2(covdat_by_ref[my_chr])
+            cy = np.log2(covdat_by_ref[my_chr]) - avg_log2
         cx = np.array([n*WINDOW_SIZE + WINDOW_SIZE/2 for n in range(len(cy))])
         mpl.scatter(cx, cy, s=1, c='black')
         mpl.xlim(0,CONTIG_SIZES[my_chr])
-        mpl.ylim(bottom=0)
+        mpl.ylim(-3,3)
         mpl.xticks(xt,xl)
         mpl.grid(which='both', linestyle='--', alpha=0.6)
         for tick in ax1.xaxis.get_major_ticks():
