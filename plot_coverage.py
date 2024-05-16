@@ -186,8 +186,8 @@ def main(raw_args=None):
                 continue
             if mapq < MIN_MAPQ:
                 continue
-            #if pos > 1000000:  # for debugging purposes
-            #   continue
+            if pos > 1000000:  # for debugging purposes
+               continue
 
             if READ_MODE == 'CLR':
                 rnm = strip_polymerase_coords(splt[0])
@@ -315,6 +315,7 @@ def main(raw_args=None):
             p_color  = []
             p_alpha  = []
             for cdat in cyto_by_chr[my_chr]:
+                print(my_chr, cdat)
                 pq = cdat[2][0]
                 my_type = cdat[3]
                 xp = [cdat[0], cdat[1]]
