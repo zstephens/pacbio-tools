@@ -186,8 +186,8 @@ def main(raw_args=None):
                 continue
             if mapq < MIN_MAPQ:
                 continue
-            if pos > 1000000:  # for debugging purposes
-               continue
+            #if pos > 1000000:  # for debugging purposes
+            #   continue
 
             if READ_MODE == 'CLR':
                 rnm = strip_polymerase_coords(splt[0])
