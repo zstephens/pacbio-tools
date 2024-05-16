@@ -315,6 +315,7 @@ def main(raw_args=None):
             p_color  = []
             p_alpha  = []
             for cdat in cyto_by_chr[my_chr]:
+                print(my_chr, cdat)
                 pq = cdat[2][0]
                 my_type = cdat[3]
                 xp = [cdat[0], cdat[1]]
