@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 import argparse
 import numpy as np
+import math
 import matplotlib.pyplot as mpl
 import pathlib
 import pysam
@@ -31,18 +32,21 @@ CYTOBAND_COLORS = {'gneg':(255,255,255),
                    'gvar':(231,214,234)}
 CYTOBAND_COLORS = {k:(v[0]/255.,v[1]/255.,v[2]/255.) for k,v in CYTOBAND_COLORS.items()}
 
+# mask these regions when computing average coverage
+UNSTABLE_REGION = ['acen', 'gvar', 'stalk']
+UNSTABLE_CHR = ['chrM']
+
 
 def strip_polymerase_coords(rn):
     return '/'.join(rn.split('/')[:-1])
 
 
-def reads_2_cov(my_chr, readpos_list_all, out_dir, CONTIG_SIZES, WINDOW_SIZE):
+def reads_2_cov(my_chr, readpos_list_all, out_dir, CONTIG_SIZES, WINDOW_SIZE, bed_regions):
     #
     if my_chr not in CONTIG_SIZES:
         print(' - skipping coverage computation for '+my_chr+'...')
         return None
     #
-    #print(' - computing coverage on '+my_chr+'...')
     cov = np.zeros(CONTIG_SIZES[my_chr], dtype='<i4')
     # collapse overlapping alignments
     for readpos_list in readpos_list_all:
@@ -64,13 +68,21 @@ def reads_2_cov(my_chr, readpos_list_all, out_dir, CONTIG_SIZES, WINDOW_SIZE):
                     break
         for rspan in readpos_list:
             cov[rspan[0]:rspan[1]] += 1
+    # report coverage for specific bed regions
+    bed_out = []
+    if my_chr in bed_regions:
+        for br in bed_regions[my_chr]:
+            b1 = max(br[0],0)
+            b2 = min(br[1],len(cov))
+            bed_out.append([br, np.mean(cov[b1:b2])])
     # downsample
+    if WINDOW_SIZE <= 1:
+        return (cov, bed_out)
     out_cov = []
     for i in range(0,len(cov),WINDOW_SIZE):
         out_cov.append(np.mean(cov[i:i+WINDOW_SIZE]))
     cov = np.array(out_cov)
-    #
-    return cov
+    return (cov, bed_out)
 
 
 def main(raw_args=None):
@@ -80,6 +92,7 @@ def main(raw_args=None):
     parser.add_argument('-r',  type=str, required=False, metavar='<str>', help="refname: t2t / hg38 / hg19",   default='t2t')
     parser.add_argument('-q',  type=int, required=False, metavar='<int>', help="minimum MAPQ",                 default=0)
     parser.add_argument('-w',  type=int, required=False, metavar='<int>', help="window size for downsampling", default=10000)
+    parser.add_argument('-b',  type=str, required=False, metavar='<str>', help="bed of regions to query",      default='')
     parser.add_argument('-rt', type=str, required=False, metavar='<str>', help="read type: CCS / CLR / ONT",   default='CCS')
     args = parser.parse_args()
 
@@ -100,23 +113,43 @@ def main(raw_args=None):
     WINDOW_SIZE = max(1,args.w)
 
     REF_VERS = args.r
+    BED_FILE = args.b
+
+    bed_regions = {}
+    if len(BED_FILE):
+        with open(BED_FILE,'r') as f:
+            for line in f:
+                splt = line.strip().split('\t')
+                if len(splt) >= 4:
+                    bed_annot = ','.join(splt[3:])
+                else:
+                    bed_annot = ''
+                if splt[0] not in bed_regions:
+                    bed_regions[splt[0]] = []
+                (p1, p2) = sorted([int(splt[1]), int(splt[2])])
+                bed_regions[splt[0]].append((p1, p2, bed_annot))
 
     sim_path = str(pathlib.Path(__file__).resolve().parent)
     resource_dir = sim_path + '/resources/'
     CYTOBAND_BED = resource_dir + f'{REF_VERS}-cytoband.bed'
     cyto_by_chr = {}
+    unstable_by_chr = {}
     with open(CYTOBAND_BED,'r') as f:
         for line in f:
             splt = line.strip().split('\t')
             if splt[0] not in cyto_by_chr:
                 cyto_by_chr[splt[0]] = []
+                unstable_by_chr[splt[0]] = []
             cyto_by_chr[splt[0]].append((int(splt[1]), int(splt[2]), splt[3], splt[4]))
+            if splt[4] in UNSTABLE_REGION:
+                unstable_by_chr[splt[0]].append((int(splt[1]), int(splt[2])))
 
     prev_ref = None
     rnm_dict = {}
     alns_by_zmw = []    # alignment start/end per zmw
     rlen_by_zmw = []    # max tlen observed for each zmw
     covdat_by_ref = {}  #
+    all_bed_result = []
     tt = time.perf_counter()
 
     if IN_BAM[-4:].lower() == '.bam':
@@ -165,7 +198,8 @@ def main(raw_args=None):
             if ref != prev_ref:
                 # compute coverage on previous ref now that we're done
                 if prev_ref is not None and len(alns_by_zmw) and prev_ref in CONTIG_SIZES:
-                    covdat_by_ref[prev_ref] = reads_2_cov(prev_ref, alns_by_zmw, OUT_DIR, CONTIG_SIZES, WINDOW_SIZE)
+                    (covdat_by_ref[prev_ref], bed_results) = reads_2_cov(prev_ref, alns_by_zmw, OUT_DIR, CONTIG_SIZES, WINDOW_SIZE, bed_regions)
+                    all_bed_result.extend(bed_results)
                     sys.stdout.write(f' ({int(time.perf_counter() - tt)} sec)\n')
                     sys.stdout.flush()
                 # reset for next ref
@@ -203,7 +237,8 @@ def main(raw_args=None):
 
         # we probably we need to process the final ref, assuming no contigs beyond chrM
         if ref not in covdat_by_ref and len(alns_by_zmw) and ref in CONTIG_SIZES:
-            covdat_by_ref[ref] = reads_2_cov(ref, alns_by_zmw, OUT_DIR, CONTIG_SIZES, WINDOW_SIZE)
+            (covdat_by_ref[ref], bed_results) = reads_2_cov(ref, alns_by_zmw, OUT_DIR, CONTIG_SIZES, WINDOW_SIZE, bed_regions)
+            all_bed_result.extend(bed_results)
             sys.stdout.write(f' ({int(time.perf_counter() - tt)} sec)\n')
             sys.stdout.flush()
 
@@ -233,20 +268,38 @@ def main(raw_args=None):
     #
     all_win = []
     for my_chr in sorted_chr:
-        cy = covdat_by_ref[my_chr]
-        all_win.extend(np.log2(cy[cy > 0.0001]).tolist())
-    avg_log2 = np.mean(all_win)
+        if my_chr in UNSTABLE_CHR:
+            continue
+        cy = np.copy(covdat_by_ref[my_chr])
+        if my_chr in unstable_by_chr:
+            for ur in unstable_by_chr[my_chr]:
+                w1 = max(math.floor(ur[0]/WINDOW_SIZE), 0)
+                w2 = min(math.ceil(ur[1]/WINDOW_SIZE), len(cy)-1)
+                cy[w1:w2+1] = -1.0
+        all_win.extend(cy[cy >= 0.0].tolist())
+    print(f'average coverage: {np.mean(all_win):0.3f}')
+    avg_log2 = np.log2(np.mean(all_win))
     del all_win
     #
+    if len(all_bed_result):
+        for n in all_bed_result:
+            print(n)
+    #
+    fig_width_scalar = 11.5/CONTIG_SIZES['chr1']
+    fig_width_buffer = 0.5
+    fig_width_min    = 2.0
+    fig_height       = 4.0
     for my_chr in sorted_chr:
-        fig = mpl.figure(1, figsize=(12,4), dpi=200)
-        gs = gridspec.GridSpec(2, 1, height_ratios=[8,1])
-        ax1 = mpl.subplot(gs[0])
         xt = np.arange(0,CONTIG_SIZES[my_chr],10000000)
         xl = [f'{n*10}M' for n in range(len(xt))]
         with np.errstate(divide='ignore'):
             cy = np.log2(covdat_by_ref[my_chr]) - avg_log2
         cx = np.array([n*WINDOW_SIZE + WINDOW_SIZE/2 for n in range(len(cy))])
+        #
+        my_width = max(CONTIG_SIZES[my_chr]*fig_width_scalar + fig_width_buffer, fig_width_min)
+        fig = mpl.figure(1, figsize=(my_width,fig_height), dpi=200)
+        gs = gridspec.GridSpec(2, 1, height_ratios=[8,1])
+        ax1 = mpl.subplot(gs[0])
         mpl.scatter(cx, cy, s=1, c='black')
         mpl.xlim(0,CONTIG_SIZES[my_chr])
         mpl.ylim(-3,3)
