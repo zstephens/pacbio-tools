@@ -279,13 +279,9 @@ def main(raw_args=None):
                 w2 = min(math.ceil(ur[1]/WINDOW_SIZE), len(cy)-1)
                 cy[w1:w2+1] = -1.0
         all_win.extend(cy[cy >= 0.0].tolist())
-    print(f'average coverage: {np.mean(all_win):0.3f}')
+    all_avg_cov = np.mean(all_win)
     avg_log2 = np.log2(np.mean(all_win))
     del all_win
-    #
-    if len(all_bed_result):
-        for n in all_bed_result:
-            print(n)
     #
     fig_width_scalar = 11.5/CONTIG_SIZES['chr1']
     fig_width_buffer = 0.5
@@ -344,6 +340,12 @@ def main(raw_args=None):
         mpl.close(fig)
     sys.stdout.write(f' ({int(time.perf_counter() - tt)} sec)\n')
     sys.stdout.flush()
+    #
+    print(f'average coverage: {all_avg_cov:0.3f}')
+    if len(all_bed_result):
+        print('region coverage:')
+        for n in all_bed_result:
+            print(f' - {n[0][2]}: {n[1]:0.3f}')
 
 
 if __name__ == '__main__':
