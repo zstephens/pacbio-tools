@@ -126,6 +126,7 @@ def main(raw_args=None):
                     bed_annot = ''
                 if splt[0] not in bed_regions:
                     bed_regions[splt[0]] = []
+                print(splt)
                 (p1, p2) = sorted([int(splt[1]), int(splt[2])])
                 bed_regions[splt[0]].append((p1, p2, bed_annot))
 
