@@ -74,7 +74,7 @@ def reads_2_cov(my_chr, readpos_list_all, out_dir, CONTIG_SIZES, WINDOW_SIZE, be
         for br in bed_regions[my_chr]:
             b1 = max(br[0],0)
             b2 = min(br[1],len(cov))
-            bed_out.append([br, np.mean(cov[b1:b2])])
+            bed_out.append([br, np.mean(cov[b1:b2]), np.median(cov[b1:b2]), np.std(cov[b1:b2])])
     # downsample
     if WINDOW_SIZE <= 1:
         return (cov, bed_out)
@@ -279,7 +279,7 @@ def main(raw_args=None):
                 w2 = min(math.ceil(ur[1]/WINDOW_SIZE), len(cy)-1)
                 cy[w1:w2+1] = -1.0
         all_win.extend(cy[cy >= 0.0].tolist())
-    all_avg_cov = np.mean(all_win)
+    all_avg_cov = (np.mean(all_win), np.median(all_win), np.std(all_win))
     avg_log2 = np.log2(np.mean(all_win))
     del all_win
     #
@@ -341,11 +341,16 @@ def main(raw_args=None):
     sys.stdout.write(f' ({int(time.perf_counter() - tt)} sec)\n')
     sys.stdout.flush()
     #
-    print(f'average coverage: {all_avg_cov:0.3f}')
+    print(f'average coverage: {all_avg_cov[0]:0.3f}')
     if len(all_bed_result):
         print('region coverage:')
         for n in all_bed_result:
             print(f' - {n[0][2]}: {n[1]:0.3f}')
+    with open(f'{OUT_DIR}region_coverage.tsv','w') as f:
+        f.write('region\tmean_cov\tmedian_cov\tstd\n')
+        f.write(f'whole_genome\t{all_avg_cov[0]:0.3f}\t{all_avg_cov[1]:0.3f}\t{all_avg_cov[2]:0.3f}\n')
+        for n in all_bed_result:
+            f.write(f'{n[0][2]}\t{n[1]:0.3f}\t{n[2]:0.3f}\t{n[3]:0.3f}\n')
 
 
 if __name__ == '__main__':
