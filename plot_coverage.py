@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 import argparse
+import gzip
 import numpy as np
 import math
 import matplotlib.pyplot as mpl
@@ -35,6 +36,17 @@ CYTOBAND_COLORS = {k:(v[0]/255.,v[1]/255.,v[2]/255.) for k,v in CYTOBAND_COLORS.
 # mask these regions when computing average coverage
 UNSTABLE_REGION = ['acen', 'gvar', 'stalk']
 UNSTABLE_CHR = ['chrM']
+
+TWO_PI = 2.0*np.pi
+
+COV_YT = range(-3,3+1)
+COV_YL = [str(n) for n in COV_YT]
+KDE_NUMPOINTS_VAF = 50
+KDE_STD_VAF = 0.03*KDE_NUMPOINTS_VAF
+KDE_STD_POS = 20000
+KDE_YT = [0.0, 0.25*KDE_NUMPOINTS_VAF, 0.50*KDE_NUMPOINTS_VAF, 0.75*KDE_NUMPOINTS_VAF, KDE_NUMPOINTS_VAF]
+KDE_YL = ['0%', '25%', '50%', '75%', '100%']
+KDE_YL = ['0', '.25', '.50', '.75', '1']
 
 
 def strip_polymerase_coords(rn):
@@ -85,6 +97,11 @@ def reads_2_cov(my_chr, readpos_list_all, out_dir, CONTIG_SIZES, WINDOW_SIZE, be
     return (cov, bed_out)
 
 
+def log_px(x, y, ux, uy, ox, oy):
+    out = -0.5*np.log(TWO_PI*ox) - ((x-ux)*(x-ux))/(2*ox*ox) - 0.5*np.log(TWO_PI*oy) - ((y-uy)*(y-uy))/(2*oy*oy)
+    return out
+
+
 def main(raw_args=None):
     parser = argparse.ArgumentParser(description='plot_coverage.py')
     parser.add_argument('-i',  type=str, required=True,  metavar='<str>', help="* input.bam")
@@ -93,6 +110,7 @@ def main(raw_args=None):
     parser.add_argument('-q',  type=int, required=False, metavar='<int>', help="minimum MAPQ",                 default=0)
     parser.add_argument('-w',  type=int, required=False, metavar='<int>', help="window size for downsampling", default=10000)
     parser.add_argument('-b',  type=str, required=False, metavar='<str>', help="bed of regions to query",      default='')
+    parser.add_argument('-v',  type=str, required=False, metavar='<str>', help="input.vcf (somatic)",          default='')
     parser.add_argument('-rt', type=str, required=False, metavar='<str>', help="read type: CCS / CLR / ONT",   default='CCS')
     args = parser.parse_args()
 
@@ -114,9 +132,10 @@ def main(raw_args=None):
 
     REF_VERS = args.r
     BED_FILE = args.b
+    IN_VCF   = args.v
 
     bed_regions = {}
-    if len(BED_FILE):
+    if BED_FILE:
         with open(BED_FILE,'r') as f:
             for line in f:
                 splt = line.strip().split('\t')
@@ -264,9 +283,50 @@ def main(raw_args=None):
         exit(1)
 
     #
-    sys.stdout.write('making plots...')
-    sys.stdout.flush()
-    tt = time.perf_counter()
+    # READ VCFs
+    # we're assuming vcfs have GT and AF fields, and are sorted
+    #
+    in_variants = {}
+    if IN_VCF:
+        sys.stdout.write('reading input VCF...')
+        sys.stdout.flush()
+        tt = time.perf_counter()
+        is_gzipped = True
+        with gzip.open(IN_VCF, 'r') as fh:
+            try:
+                fh.read(1)
+            except OSError:
+                is_gzipped = False
+        if is_gzipped:
+            f = gzip.open(IN_VCF,'rt')
+        else:
+            f = open(IN_VCF,'r')
+        for line in f:
+            if line[0] != '#':
+                splt = line.strip().split('\t')
+                my_chr = splt[0]
+                my_pos = int(splt[1])
+                my_filt = splt[6]
+                if my_filt in ['PASS', 'NonSomatic']:
+                    fmt_split = splt[8].split(':')
+                    dat_split = splt[9].split(':')
+                    if 'GT' in fmt_split and 'AF' in fmt_split:
+                        ind_gt = fmt_split.index('GT')
+                        ind_af = fmt_split.index('AF')
+                        my_gt = dat_split[ind_gt]
+                        my_af = float(dat_split[ind_af])
+                        if my_gt == '1/1' or my_gt == '1|1' or my_af >= 0.950:
+                            pass
+                        else:
+                            if my_chr not in in_variants:
+                                in_variants[my_chr] = [[], []]
+                            in_variants[my_chr][0].append(my_pos)
+                            in_variants[my_chr][1].append(my_af)
+                            #print(splt[0], splt[1], splt[3], splt[4], my_filt, my_gt, my_af)
+        f.close()
+        sys.stdout.write(f' ({int(time.perf_counter() - tt)} sec)\n')
+        sys.stdout.flush()
+
     #
     all_win = []
     for my_chr in sorted_chr:
@@ -280,14 +340,18 @@ def main(raw_args=None):
                 cy[w1:w2+1] = -1.0
         all_win.extend(cy[cy >= 0.0].tolist())
     all_avg_cov = (np.mean(all_win), np.median(all_win), np.std(all_win))
-    avg_log2 = np.log2(np.mean(all_win))
+    avg_log2 = np.log2(np.median(all_win))
     del all_win
     #
     fig_width_scalar = 11.5/CONTIG_SIZES['chr1']
     fig_width_buffer = 0.5
     fig_width_min    = 2.0
-    fig_height       = 4.0
+    fig_height       = 5.0
     for my_chr in sorted_chr:
+        sys.stdout.write(f'making plots for {my_chr}...')
+        sys.stdout.flush()
+        tt = time.perf_counter()
+        #
         xt = np.arange(0,CONTIG_SIZES[my_chr],10000000)
         xl = [f'{n*10}M' for n in range(len(xt))]
         with np.errstate(divide='ignore'):
@@ -296,13 +360,15 @@ def main(raw_args=None):
         #
         my_width = max(CONTIG_SIZES[my_chr]*fig_width_scalar + fig_width_buffer, fig_width_min)
         fig = mpl.figure(1, figsize=(my_width,fig_height), dpi=200)
-        gs = gridspec.GridSpec(2, 1, height_ratios=[8,1])
+        gs = gridspec.GridSpec(3, 1, height_ratios=[4,4,1])
         ax1 = mpl.subplot(gs[0])
         mpl.scatter(cx, cy, s=1, c='black')
         mpl.xlim(0,CONTIG_SIZES[my_chr])
-        mpl.ylim(-3,3)
+        mpl.ylim(COV_YT[0],COV_YT[-1])
         mpl.xticks(xt,xl)
+        mpl.yticks(COV_YT, COV_YL)
         mpl.grid(which='both', linestyle='--', alpha=0.6)
+        mpl.ylabel('log2 cov change')
         for tick in ax1.xaxis.get_major_ticks():
             tick.tick1line.set_visible(False)
             tick.tick2line.set_visible(False)
@@ -310,6 +376,39 @@ def main(raw_args=None):
             tick.label2.set_visible(False)
         #
         ax2 = mpl.subplot(gs[1])
+        Z = np.zeros((KDE_NUMPOINTS_VAF, int(CONTIG_SIZES[my_chr]/WINDOW_SIZE)+1))
+        if my_chr in in_variants:
+            #(markerline, stemlines, baseline) = mpl.stem(in_variants[my_chr][0], in_variants[my_chr][1])
+            #mpl.setp(baseline, visible=False)
+            #mpl.setp(stemlines, visible=False)
+            #mpl.setp(markerline, markersize=1)
+            for vi in range(len(in_variants[my_chr][0])):
+                #print(vi, '/', len(in_variants[my_chr][0]))
+                my_vpos = int(in_variants[my_chr][0][vi]/WINDOW_SIZE)
+                my_vvaf = int(in_variants[my_chr][1][vi]*KDE_NUMPOINTS_VAF)
+                my_std_pos = KDE_STD_POS/WINDOW_SIZE
+                my_pos_buff = int(my_std_pos*3) # go out 3 stds on either side
+                my_vaf_buff = int(KDE_STD_VAF*3)
+                for zy in range(max(0,my_vpos-my_pos_buff), min(Z.shape[1],my_vpos+my_pos_buff)):
+                    for zx in range(max(0,my_vvaf-my_vaf_buff), min(Z.shape[0],my_vvaf+my_vaf_buff)):
+                        Z[zx,zy] += np.exp(log_px(zx, zy, my_vvaf, my_vpos, KDE_STD_VAF, my_std_pos))
+            for zy in range(Z.shape[1]):
+                my_sum = np.sum(Z[:,zy])
+                if my_sum > 0.0:
+                    Z[:,zy] /= my_sum
+        Z = np.array(Z[::-1])
+        X, Y = np.meshgrid(range(0,len(Z[0])+1), range(0,len(Z)+1))
+        mpl.pcolormesh(X,Y,Z)
+        mpl.axis([0,len(Z[0]),0,len(Z)])
+        mpl.yticks(KDE_YT, KDE_YL)
+        mpl.ylabel('het VAF')
+        for tick in ax2.xaxis.get_major_ticks():
+            tick.tick1line.set_visible(False)
+            tick.tick2line.set_visible(False)
+            tick.label1.set_visible(False)
+            tick.label2.set_visible(False)
+        #
+        ax3 = mpl.subplot(gs[2])
         if my_chr in cyto_by_chr:
             polygons = []
             p_color  = []
@@ -329,17 +428,17 @@ def main(raw_args=None):
                 p_color.append(CYTOBAND_COLORS[my_type])
                 p_alpha.append(0.8)
             for j in range(len(polygons)):
-                ax2.add_collection(PatchCollection([polygons[j]], color=p_color[j], alpha=p_alpha[j], linewidth=0))
+                ax3.add_collection(PatchCollection([polygons[j]], color=p_color[j], alpha=p_alpha[j], linewidth=0))
         mpl.xticks(xt,xl,rotation=70)
         mpl.yticks([],[])
         mpl.xlim(0,CONTIG_SIZES[my_chr])
         mpl.ylim(-1,1)
-        #
         mpl.tight_layout()
         mpl.savefig(f'{OUT_DIR}cov_{my_chr}.png')
         mpl.close(fig)
-    sys.stdout.write(f' ({int(time.perf_counter() - tt)} sec)\n')
-    sys.stdout.flush()
+        #
+        sys.stdout.write(f' ({int(time.perf_counter() - tt)} sec)\n')
+        sys.stdout.flush()
     #
     print(f'average coverage: {all_avg_cov[0]:0.3f}')
     if len(all_bed_result):
