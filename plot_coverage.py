@@ -14,6 +14,8 @@ from matplotlib import gridspec
 from matplotlib.patches import Polygon
 from matplotlib.collections import PatchCollection
 
+from scipy.stats import wasserstein_distance
+
 from common.ref_func_corgi import HG38_SIZES, HG19_SIZES, T2T11_SIZES, TELOGATOR_SIZES, LEXICO_2_IND, makedir
 
 REF_CHAR = 'MX=D'
@@ -33,6 +35,18 @@ CYTOBAND_COLORS = {'gneg':(255,255,255),
                    'gvar':(231,214,234)}
 CYTOBAND_COLORS = {k:(v[0]/255.,v[1]/255.,v[2]/255.) for k,v in CYTOBAND_COLORS.items()}
 
+CHROM_COLOR_CYCLE = [(32, 119, 184),
+                     (245, 126, 19),
+                     (43, 159, 44),
+                     (214, 37, 42),
+                     (143, 103, 182),
+                     (139, 85, 78),
+                     (226, 120, 194),
+                     (126, 126, 126),
+                     (189, 188, 36),
+                     (27, 189, 210)]
+CHROM_COLOR_CYCLE = [(v[0]/255.,v[1]/255.,v[2]/255.) for v in CHROM_COLOR_CYCLE]
+
 # mask these regions when computing average coverage
 UNSTABLE_REGION = ['acen', 'gvar', 'stalk']
 UNSTABLE_CHR = ['chrM']
@@ -42,7 +56,7 @@ TWO_PI = 2.0*np.pi
 COV_YT = range(-3,3+1)
 COV_YL = [str(n) for n in COV_YT]
 KDE_NUMPOINTS_VAF = 50
-KDE_STD_VAF = 0.03*KDE_NUMPOINTS_VAF
+KDE_STD_VAF = 0.025*KDE_NUMPOINTS_VAF
 KDE_STD_POS = 20000
 KDE_YT = [0.0, 0.25*KDE_NUMPOINTS_VAF, 0.50*KDE_NUMPOINTS_VAF, 0.75*KDE_NUMPOINTS_VAF, KDE_NUMPOINTS_VAF]
 KDE_YL = ['0%', '25%', '50%', '75%', '100%']
@@ -102,6 +116,20 @@ def log_px(x, y, ux, uy, ox, oy):
     return out
 
 
+def get_template_vaf(vaf_list, WINDOW_SIZE, vaf_std):
+    template = np.zeros((KDE_NUMPOINTS_VAF), dtype='float')
+    my_std_pos = KDE_STD_POS/WINDOW_SIZE
+    for my_vvaf in vaf_list:
+        for zx in range(template.shape[0]):
+            template[zx] += np.exp(log_px(zx, 0, int(my_vvaf*KDE_NUMPOINTS_VAF), 0, vaf_std, my_std_pos))
+    template /= np.sum(template)
+    return template
+
+
+def emd(pdf_a, pdf_b):
+    return wasserstein_distance(np.arange(len(pdf_a)), np.arange(len(pdf_b)), pdf_a, pdf_b)
+
+
 def main(raw_args=None):
     parser = argparse.ArgumentParser(description='plot_coverage.py')
     parser.add_argument('-i',  type=str, required=True,  metavar='<str>', help="* input.bam")
@@ -111,6 +139,7 @@ def main(raw_args=None):
     parser.add_argument('-w',  type=int, required=False, metavar='<int>', help="window size for downsampling", default=10000)
     parser.add_argument('-b',  type=str, required=False, metavar='<str>', help="bed of regions to query",      default='')
     parser.add_argument('-v',  type=str, required=False, metavar='<str>', help="input.vcf (somatic)",          default='')
+    parser.add_argument('-s',  type=str, required=False, metavar='<str>', help="sample name",                  default='')
     parser.add_argument('-rt', type=str, required=False, metavar='<str>', help="read type: CCS / CLR / ONT",   default='CCS')
     args = parser.parse_args()
 
@@ -125,14 +154,22 @@ def main(raw_args=None):
     if OUT_DIR[-1] != '/':
         OUT_DIR += '/'
     makedir(OUT_DIR)
-    OUT_NPZ = OUT_DIR+'cov.npz'
+    PLOT_DIR = OUT_DIR + 'plots/'
+    makedir(PLOT_DIR)
 
     MIN_MAPQ = max(0,args.q)
     WINDOW_SIZE = max(1,args.w)
 
-    REF_VERS = args.r
-    BED_FILE = args.b
-    IN_VCF   = args.v
+    REF_VERS  = args.r
+    BED_FILE  = args.b
+    IN_VCF    = args.v
+    SAMP_NAME = args.s
+
+    OUT_NPZ = f'{OUT_DIR}cov.npz'
+    VAF_NPZ = f'{OUT_DIR}vaf.npz'
+    if SAMP_NAME:
+        OUT_NPZ = f'{OUT_DIR}cov_{SAMP_NAME}.npz'
+        VAF_NPZ = f'{OUT_DIR}vaf_{SAMP_NAME}.npz'
 
     bed_regions = {}
     if BED_FILE:
@@ -287,46 +324,74 @@ def main(raw_args=None):
     # we're assuming vcfs have GT and AF fields, and are sorted
     #
     in_variants = {}
+    var_kde_by_chr = {}
+    USING_VAR_NPZ = False
     if IN_VCF:
-        sys.stdout.write('reading input VCF...')
-        sys.stdout.flush()
-        tt = time.perf_counter()
-        is_gzipped = True
-        with gzip.open(IN_VCF, 'r') as fh:
-            try:
-                fh.read(1)
-            except OSError:
-                is_gzipped = False
-        if is_gzipped:
-            f = gzip.open(IN_VCF,'rt')
+        if IN_VCF[-4:].lower() == '.vcf' or IN_VCF[-7:].lower() == '.vcf.gz':
+            sys.stdout.write('reading input VCF...')
+            sys.stdout.flush()
+            tt = time.perf_counter()
+            is_gzipped = True
+            with gzip.open(IN_VCF, 'r') as fh:
+                try:
+                    fh.read(1)
+                except OSError:
+                    is_gzipped = False
+            if is_gzipped:
+                f = gzip.open(IN_VCF,'rt')
+            else:
+                f = open(IN_VCF,'r')
+            for line in f:
+                if line[0] != '#':
+                    splt = line.strip().split('\t')
+                    my_chr = splt[0]
+                    my_pos = int(splt[1])
+                    my_filt = splt[6]
+                    if my_filt in ['PASS', 'NonSomatic']:
+                        fmt_split = splt[8].split(':')
+                        dat_split = splt[9].split(':')
+                        if 'GT' in fmt_split and 'AF' in fmt_split:
+                            ind_gt = fmt_split.index('GT')
+                            ind_af = fmt_split.index('AF')
+                            my_gt = dat_split[ind_gt]
+                            my_af = float(dat_split[ind_af])
+                            if my_gt == '1/1' or my_gt == '1|1' or my_af >= 0.950:
+                                pass
+                            else:
+                                if my_chr not in in_variants:
+                                    in_variants[my_chr] = [[], []]
+                                in_variants[my_chr][0].append(my_pos)
+                                in_variants[my_chr][1].append(my_af)
+                                #print(splt[0], splt[1], splt[3], splt[4], my_filt, my_gt, my_af)
+            f.close()
+            sys.stdout.write(f' ({int(time.perf_counter() - tt)} sec)\n')
+            sys.stdout.flush()
+        #
+        elif IN_VCF[-4:].lower() == '.npz':
+            print('reading from an existing npz archive instead of vcf...')
+            in_npz = np.load(IN_VCF)
+            var_kde_by_chr = {k:in_npz[k] for k in sorted_chr}
+            USING_VAR_NPZ = True
+        #
         else:
-            f = open(IN_VCF,'r')
-        for line in f:
-            if line[0] != '#':
-                splt = line.strip().split('\t')
-                my_chr = splt[0]
-                my_pos = int(splt[1])
-                my_filt = splt[6]
-                if my_filt in ['PASS', 'NonSomatic']:
-                    fmt_split = splt[8].split(':')
-                    dat_split = splt[9].split(':')
-                    if 'GT' in fmt_split and 'AF' in fmt_split:
-                        ind_gt = fmt_split.index('GT')
-                        ind_af = fmt_split.index('AF')
-                        my_gt = dat_split[ind_gt]
-                        my_af = float(dat_split[ind_af])
-                        if my_gt == '1/1' or my_gt == '1|1' or my_af >= 0.950:
-                            pass
-                        else:
-                            if my_chr not in in_variants:
-                                in_variants[my_chr] = [[], []]
-                            in_variants[my_chr][0].append(my_pos)
-                            in_variants[my_chr][1].append(my_af)
-                            #print(splt[0], splt[1], splt[3], splt[4], my_filt, my_gt, my_af)
-        f.close()
-        sys.stdout.write(f' ({int(time.perf_counter() - tt)} sec)\n')
-        sys.stdout.flush()
+            print('Error: -v must be .vcf or .vcf.gz or .npz')
+            exit(1)
 
+    #
+    # make VAF templates
+    #
+    VAF_TEMPLATES = {}
+    VAF_TEMPLATES['hom'] = get_template_vaf([0.100], WINDOW_SIZE, KDE_STD_VAF*1.0)
+    VAF_TEMPLATES['het'] = get_template_vaf([0.500], WINDOW_SIZE, KDE_STD_VAF*2.0)
+    for copynum in range(3,6):
+        for numer in range(1,int(copynum/2)+1):
+            if numer*2 != copynum:
+                my_vaf = numer/copynum
+                VAF_TEMPLATES[f'{copynum}-{numer}'] = get_template_vaf([my_vaf, 1.0-my_vaf], WINDOW_SIZE, KDE_STD_VAF*1.0)
+
+    #
+    # determine average coverage across whole genome
+    # -- in most cases this will correspond to 2 copies, but not always
     #
     all_win = []
     for my_chr in sorted_chr:
@@ -342,6 +407,11 @@ def main(raw_args=None):
     all_avg_cov = (np.mean(all_win), np.median(all_win), np.std(all_win))
     avg_log2 = np.log2(np.median(all_win))
     del all_win
+
+    plotted_cx_cy = {}
+
+    #
+    # plotting!
     #
     fig_width_scalar = 11.5/CONTIG_SIZES['chr1']
     fig_width_buffer = 0.5
@@ -357,14 +427,15 @@ def main(raw_args=None):
         with np.errstate(divide='ignore'):
             cy = np.log2(covdat_by_ref[my_chr]) - avg_log2
         cx = np.array([n*WINDOW_SIZE + WINDOW_SIZE/2 for n in range(len(cy))])
+        plotted_cx_cy[my_chr] = (np.copy(cx), np.copy(cy))
         #
         my_width = max(CONTIG_SIZES[my_chr]*fig_width_scalar + fig_width_buffer, fig_width_min)
         fig = mpl.figure(1, figsize=(my_width,fig_height), dpi=200)
         gs = gridspec.GridSpec(3, 1, height_ratios=[4,4,1])
         ax1 = mpl.subplot(gs[0])
         mpl.scatter(cx, cy, s=1, c='black')
-        mpl.xlim(0,CONTIG_SIZES[my_chr])
-        mpl.ylim(COV_YT[0],COV_YT[-1])
+        mpl.xlim(0, CONTIG_SIZES[my_chr])
+        mpl.ylim(COV_YT[0], COV_YT[-1])
         mpl.xticks(xt,xl)
         mpl.yticks(COV_YT, COV_YL)
         mpl.grid(which='both', linestyle='--', alpha=0.6)
@@ -376,32 +447,65 @@ def main(raw_args=None):
             tick.label2.set_visible(False)
         #
         ax2 = mpl.subplot(gs[1])
-        Z = np.zeros((KDE_NUMPOINTS_VAF, int(CONTIG_SIZES[my_chr]/WINDOW_SIZE)+1))
-        if my_chr in in_variants:
-            #(markerline, stemlines, baseline) = mpl.stem(in_variants[my_chr][0], in_variants[my_chr][1])
-            #mpl.setp(baseline, visible=False)
-            #mpl.setp(stemlines, visible=False)
-            #mpl.setp(markerline, markersize=1)
-            for vi in range(len(in_variants[my_chr][0])):
-                #print(vi, '/', len(in_variants[my_chr][0]))
-                my_vpos = int(in_variants[my_chr][0][vi]/WINDOW_SIZE)
-                my_vvaf = int(in_variants[my_chr][1][vi]*KDE_NUMPOINTS_VAF)
-                my_std_pos = KDE_STD_POS/WINDOW_SIZE
-                my_pos_buff = int(my_std_pos*3) # go out 3 stds on either side
-                my_vaf_buff = int(KDE_STD_VAF*3)
-                for zy in range(max(0,my_vpos-my_pos_buff), min(Z.shape[1],my_vpos+my_pos_buff)):
-                    for zx in range(max(0,my_vvaf-my_vaf_buff), min(Z.shape[0],my_vvaf+my_vaf_buff)):
-                        Z[zx,zy] += np.exp(log_px(zx, zy, my_vvaf, my_vpos, KDE_STD_VAF, my_std_pos))
-            for zy in range(Z.shape[1]):
-                my_sum = np.sum(Z[:,zy])
-                if my_sum > 0.0:
-                    Z[:,zy] /= my_sum
-        Z = np.array(Z[::-1])
+        if USING_VAR_NPZ:
+            Z = var_kde_by_chr[my_chr]
+        else:
+            Z = np.zeros((KDE_NUMPOINTS_VAF, int(CONTIG_SIZES[my_chr]/WINDOW_SIZE)+1), dtype='float')
+            if my_chr in in_variants:
+                #(markerline, stemlines, baseline) = mpl.stem(in_variants[my_chr][0], in_variants[my_chr][1])
+                #mpl.setp(baseline, visible=False)
+                #mpl.setp(stemlines, visible=False)
+                #mpl.setp(markerline, markersize=1)
+                for vi in range(len(in_variants[my_chr][0])):
+                    #print(vi, '/', len(in_variants[my_chr][0]))
+                    my_vpos = int(in_variants[my_chr][0][vi]/WINDOW_SIZE)
+                    my_vvaf = int(in_variants[my_chr][1][vi]*KDE_NUMPOINTS_VAF)
+                    my_std_pos = KDE_STD_POS/WINDOW_SIZE
+                    my_pos_buff = int(my_std_pos*3) # go out 3 stds on either side
+                    my_vaf_buff = int(KDE_STD_VAF*3)
+                    for zy in range(max(0,my_vpos-my_pos_buff), min(Z.shape[1],my_vpos+my_pos_buff)):
+                        for zx in range(max(0,my_vvaf-my_vaf_buff), min(Z.shape[0],my_vvaf+my_vaf_buff)):
+                            Z[zx,zy] += np.exp(log_px(zx, zy, my_vvaf, my_vpos, KDE_STD_VAF, my_std_pos))
+                for zy in range(Z.shape[1]):
+                    my_sum = np.sum(Z[:,zy])
+                    if my_sum > 0.0:
+                        Z[:,zy] /= my_sum
+            Z = np.array(Z[::-1])
+            var_kde_by_chr[my_chr] = np.array(Z, copy=True)
+        #
+        # VAF template detection
+        #
+        if my_chr not in UNSTABLE_CHR:
+            for cdat in cyto_by_chr[my_chr]:
+                my_type = cdat[3]
+                if my_type not in UNSTABLE_REGION:
+                    xp = [int(cdat[0]/WINDOW_SIZE), int(cdat[1]/WINDOW_SIZE)+1]
+                    if np.sum(Z[:,xp[0]:xp[1]]) <= 0.0:
+                        continue
+                    avg_signal = np.mean(Z[:,xp[0]:xp[1]], axis=1)
+                    my_sum = np.sum(avg_signal)
+                    if my_sum > 0.0:
+                        avg_signal /= my_sum
+                        sorted_scores = []
+                        for template_name,vaf_template in VAF_TEMPLATES.items():
+                            my_dist = emd(vaf_template, avg_signal)
+                            sorted_scores.append((my_dist, template_name))
+                            ####fig999 = mpl.figure(999)
+                            ####mpl.plot(np.arange(len(vaf_template)), vaf_template, '--r')
+                            ####mpl.plot(np.arange(len(avg_signal)), avg_signal, '-b')
+                            ####mpl.title(f'{my_chr}:{my_type}:{xp[0]}-{xp[1]} vs. {template_name}')
+                            ####mpl.legend([f'{my_dist:0.3f}'])
+                            ####mpl.savefig(f'{PLOT_DIR}{my_chr}_{my_type}_{xp[0]}-{xp[1]}_{template_name}.png')
+                            ####mpl.close(fig999)
+                        sorted_scores = sorted(sorted_scores)
+                        print(sorted_scores[:3])
+            #Z = np.tile(vaf_template, (1,Z.shape[1]))
+        #
         X, Y = np.meshgrid(range(0,len(Z[0])+1), range(0,len(Z)+1))
         mpl.pcolormesh(X,Y,Z)
         mpl.axis([0,len(Z[0]),0,len(Z)])
         mpl.yticks(KDE_YT, KDE_YL)
-        mpl.ylabel('het VAF')
+        mpl.ylabel('BAF')
         for tick in ax2.xaxis.get_major_ticks():
             tick.tick1line.set_visible(False)
             tick.tick2line.set_visible(False)
@@ -434,12 +538,80 @@ def main(raw_args=None):
         mpl.xlim(0,CONTIG_SIZES[my_chr])
         mpl.ylim(-1,1)
         mpl.tight_layout()
-        mpl.savefig(f'{OUT_DIR}cov_{my_chr}.png')
+        mpl.savefig(f'{PLOT_DIR}cov_{my_chr}.png')
         mpl.close(fig)
         #
         sys.stdout.write(f' ({int(time.perf_counter() - tt)} sec)\n')
         sys.stdout.flush()
+
+    if USING_VAR_NPZ is False:
+        np.savez_compressed(VAF_NPZ, **var_kde_by_chr)
+
     #
+    # whole genome plot
+    #
+    plot_fn = f'{PLOT_DIR}cov_wholegenome.png'
+    if SAMP_NAME:
+        plot_fn = f'{PLOT_DIR}cov_wholegenome_{SAMP_NAME}.png'
+    fig = mpl.figure(1, figsize=(30,10), dpi=200)
+    ax1 = mpl.subplot(211)
+    current_x_offset = 0
+    current_color_ind = 0
+    concat_var_matrix = None
+    chrom_xticks_major = [0]
+    chrom_xlabels_major = ['']
+    chrom_xticks_minor = []
+    chrom_xlabels_minor = []
+    for my_chr in sorted_chr:
+        my_color = CHROM_COLOR_CYCLE[current_color_ind % len(CHROM_COLOR_CYCLE)]
+        (cx, cy) = plotted_cx_cy[my_chr]
+        Zvar = var_kde_by_chr[my_chr]
+        if my_chr == sorted_chr[0]:
+            concat_var_matrix = Zvar
+        else:
+            concat_var_matrix = np.concatenate((concat_var_matrix, Zvar), axis=1)
+        #
+        if my_chr in unstable_by_chr:
+            for ur in unstable_by_chr[my_chr]:
+                w1 = max(math.floor(ur[0]/WINDOW_SIZE), 0)
+                w2 = min(math.ceil(ur[1]/WINDOW_SIZE), len(cy)-1)
+                cy[w1:w2+1] = COV_YT[0] - 1.0
+        #
+        mpl.scatter(cx + current_x_offset, cy, s=0.5, color=my_color)
+        chrom_xticks_minor.append(current_x_offset + 0.5 * len(cx) * WINDOW_SIZE)
+        chrom_xlabels_minor.append(my_chr)
+        chrom_xticks_major.append(current_x_offset + len(cx) * WINDOW_SIZE)
+        chrom_xlabels_major.append('')
+        current_x_offset += len(cx) * WINDOW_SIZE
+        current_color_ind += 1
+    mpl.xticks(chrom_xticks_major, chrom_xlabels_major)
+    mpl.xticks(chrom_xticks_minor, chrom_xlabels_minor, minor=True)
+    mpl.xlim([0, current_x_offset])
+    mpl.ylim(COV_YT[0], COV_YT[-1])
+    mpl.grid(which='major', linestyle='--', alpha=0.6)
+    mpl.ylabel('log2 cov change')
+    mpl.title(f'average coverage: {all_avg_cov[0]:0.3f}')
+    for tick in ax1.xaxis.get_minor_ticks():
+        tick.tick1line.set_visible(False)
+        tick.tick2line.set_visible(False)
+    #
+    ax2 = mpl.subplot(212)
+    Z = concat_var_matrix
+    X, Y = np.meshgrid(range(0,len(Z[0])+1), range(0,len(Z)+1))
+    mpl.pcolormesh(X,Y,Z)
+    mpl.axis([0,len(Z[0]),0,len(Z)])
+    mpl.yticks(KDE_YT, KDE_YL)
+    mpl.ylabel('BAF')
+    for tick in ax2.xaxis.get_major_ticks():
+        tick.tick1line.set_visible(False)
+        tick.tick2line.set_visible(False)
+        tick.label1.set_visible(False)
+        tick.label2.set_visible(False)
+    #
+    mpl.tight_layout()
+    mpl.savefig(plot_fn)
+    mpl.close(fig)
+
     print(f'average coverage: {all_avg_cov[0]:0.3f}')
     if len(all_bed_result):
         print('region coverage:')
