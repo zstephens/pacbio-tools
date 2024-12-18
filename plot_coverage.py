@@ -165,6 +165,8 @@ def main(raw_args=None):
     IN_VCF    = args.v
     SAMP_NAME = args.s
 
+    REPORT_COPYNUM = False
+
     OUT_NPZ = f'{OUT_DIR}cov.npz'
     VAF_NPZ = f'{OUT_DIR}vaf.npz'
     if SAMP_NAME:
@@ -314,6 +316,8 @@ def main(raw_args=None):
         print(f' - ignoring -r and instead using: {REF_VERS}')
         print(f' - ignoring -w and instead using: {WINDOW_SIZE}')
         CONTIG_SIZES = REFFILE_NAMES[REF_VERS]
+        if BED_FILE:
+            print('Warning: a bed file was specified but will be ignored because input is .npz')
     #
     else:
         print('Error: -i must be .bam or .npz')
@@ -473,33 +477,35 @@ def main(raw_args=None):
             Z = np.array(Z[::-1])
             var_kde_by_chr[my_chr] = np.array(Z, copy=True)
         #
-        # VAF template detection
+        # EXPERIMENTAL FEATURE: VAF template detection
+        # -- goes cytoband by cytoband --> sliding windows within each cytoband
         #
-        if my_chr not in UNSTABLE_CHR:
-            for cdat in cyto_by_chr[my_chr]:
-                my_type = cdat[3]
-                if my_type not in UNSTABLE_REGION:
-                    xp = [int(cdat[0]/WINDOW_SIZE), int(cdat[1]/WINDOW_SIZE)+1]
-                    if np.sum(Z[:,xp[0]:xp[1]]) <= 0.0:
-                        continue
-                    avg_signal = np.mean(Z[:,xp[0]:xp[1]], axis=1)
-                    my_sum = np.sum(avg_signal)
-                    if my_sum > 0.0:
-                        avg_signal /= my_sum
-                        sorted_scores = []
-                        for template_name,vaf_template in VAF_TEMPLATES.items():
-                            my_dist = emd(vaf_template, avg_signal)
-                            sorted_scores.append((my_dist, template_name))
-                            ####fig999 = mpl.figure(999)
-                            ####mpl.plot(np.arange(len(vaf_template)), vaf_template, '--r')
-                            ####mpl.plot(np.arange(len(avg_signal)), avg_signal, '-b')
-                            ####mpl.title(f'{my_chr}:{my_type}:{xp[0]}-{xp[1]} vs. {template_name}')
-                            ####mpl.legend([f'{my_dist:0.3f}'])
-                            ####mpl.savefig(f'{PLOT_DIR}{my_chr}_{my_type}_{xp[0]}-{xp[1]}_{template_name}.png')
-                            ####mpl.close(fig999)
-                        sorted_scores = sorted(sorted_scores)
-                        print(sorted_scores[:3])
-            #Z = np.tile(vaf_template, (1,Z.shape[1]))
+        if REPORT_COPYNUM:
+            if my_chr not in UNSTABLE_CHR:
+                for cdat in cyto_by_chr[my_chr]:
+                    my_type = cdat[3]
+                    if my_type not in UNSTABLE_REGION:
+                        xp = [int(cdat[0]/WINDOW_SIZE), int(cdat[1]/WINDOW_SIZE)+1]
+                        if np.sum(Z[:,xp[0]:xp[1]]) <= 0.0:
+                            continue
+                        avg_signal = np.mean(Z[:,xp[0]:xp[1]], axis=1)
+                        my_sum = np.sum(avg_signal)
+                        if my_sum > 0.0:
+                            avg_signal /= my_sum
+                            sorted_scores = []
+                            for template_name,vaf_template in VAF_TEMPLATES.items():
+                                my_dist = emd(vaf_template, avg_signal)
+                                sorted_scores.append((my_dist, template_name))
+                                ####fig999 = mpl.figure(999)
+                                ####mpl.plot(np.arange(len(vaf_template)), vaf_template, '--r')
+                                ####mpl.plot(np.arange(len(avg_signal)), avg_signal, '-b')
+                                ####mpl.title(f'{my_chr}:{my_type}:{xp[0]}-{xp[1]} vs. {template_name}')
+                                ####mpl.legend([f'{my_dist:0.3f}'])
+                                ####mpl.savefig(f'{PLOT_DIR}{my_chr}_{my_type}_{xp[0]}-{xp[1]}_{template_name}.png')
+                                ####mpl.close(fig999)
+                            sorted_scores = sorted(sorted_scores)
+                            print(sorted_scores[:3])
+                #Z = np.tile(vaf_template, (1,Z.shape[1]))
         #
         X, Y = np.meshgrid(range(0,len(Z[0])+1), range(0,len(Z)+1))
         mpl.pcolormesh(X,Y,Z)
