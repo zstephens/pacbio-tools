@@ -134,13 +134,16 @@ def main(raw_args=None):
     parser = argparse.ArgumentParser(description='plot_coverage.py')
     parser.add_argument('-i',  type=str, required=True,  metavar='<str>', help="* input.bam")
     parser.add_argument('-o',  type=str, required=True,  metavar='<str>', help="* output_dir/")
-    parser.add_argument('-r',  type=str, required=False, metavar='<str>', help="refname: t2t / hg38 / hg19",   default='t2t')
-    parser.add_argument('-q',  type=int, required=False, metavar='<int>', help="minimum MAPQ",                 default=0)
-    parser.add_argument('-w',  type=int, required=False, metavar='<int>', help="window size for downsampling", default=10000)
-    parser.add_argument('-b',  type=str, required=False, metavar='<str>', help="bed of regions to query",      default='')
-    parser.add_argument('-v',  type=str, required=False, metavar='<str>', help="input.vcf (somatic)",          default='')
-    parser.add_argument('-s',  type=str, required=False, metavar='<str>', help="sample name",                  default='')
-    parser.add_argument('-rt', type=str, required=False, metavar='<str>', help="read type: CCS / CLR / ONT",   default='CCS')
+    parser.add_argument('-r',  type=str, required=False, metavar='<str>', help="refname: t2t / hg38 / hg19",     default='t2t')
+    parser.add_argument('-q',  type=int, required=False, metavar='<int>', help="minimum MAPQ",                   default=0)
+    parser.add_argument('-w',  type=int, required=False, metavar='<int>', help="window size for downsampling",   default=10000)
+    parser.add_argument('-b',  type=str, required=False, metavar='<str>', help="bed of regions to query",        default='')
+    parser.add_argument('-v',  type=str, required=False, metavar='<str>', help="input.vcf",                      default='')
+    parser.add_argument('-vf', type=str, required=False, metavar='<str>', help="variant filters to use",         default='PASS')
+    parser.add_argument('-vw', type=int, required=False, metavar='<int>', help="window size for var density",    default=10000)
+    parser.add_argument('-cw', type=int, required=False, metavar='<int>', help="window size for cnv prediction", default=1000000)
+    parser.add_argument('-s',  type=str, required=False, metavar='<str>', help="sample name",                    default='')
+    parser.add_argument('-rt', type=str, required=False, metavar='<str>', help="read type: CCS / CLR / ONT",     default='CCS')
     args = parser.parse_args()
 
     IN_BAM = args.i
@@ -157,21 +160,28 @@ def main(raw_args=None):
     PLOT_DIR = OUT_DIR + 'plots/'
     makedir(PLOT_DIR)
 
-    MIN_MAPQ = max(0,args.q)
-    WINDOW_SIZE = max(1,args.w)
+    MIN_MAPQ = max(0, args.q)
+    WINDOW_SIZE = max(1, args.w)
+    VAR_WINDOW = max(1, args.vw)
+    CNV_WINDOW = max(1, args.cw)
+    CNV_NUM_INDS = int((CNV_WINDOW / VAR_WINDOW) + 0.5)
 
     REF_VERS  = args.r
     BED_FILE  = args.b
     IN_VCF    = args.v
     SAMP_NAME = args.s
 
-    REPORT_COPYNUM = False
+    VAR_FILTERS = args.vf.split(',')
+
+    REPORT_COPYNUM = True
 
     OUT_NPZ = f'{OUT_DIR}cov.npz'
     VAF_NPZ = f'{OUT_DIR}vaf.npz'
+    CNV_BED = f'{OUT_DIR}cnv.bed'
     if SAMP_NAME:
         OUT_NPZ = f'{OUT_DIR}cov_{SAMP_NAME}.npz'
         VAF_NPZ = f'{OUT_DIR}vaf_{SAMP_NAME}.npz'
+        CNV_BED = f'{OUT_DIR}cnv_{SAMP_NAME}.bed'
 
     bed_regions = {}
     if BED_FILE:
@@ -203,6 +213,7 @@ def main(raw_args=None):
             cyto_by_chr[splt[0]].append((int(splt[1]), int(splt[2]), splt[3], splt[4]))
             if splt[4] in UNSTABLE_REGION:
                 unstable_by_chr[splt[0]].append((int(splt[1]), int(splt[2])))
+    BUFFER_UNSTABLE = max(int(1000000/VAR_WINDOW), 1)
 
     prev_ref = None
     rnm_dict = {}
@@ -329,6 +340,7 @@ def main(raw_args=None):
     #
     in_variants = {}
     var_kde_by_chr = {}
+    var_dens_by_chr = {}
     USING_VAR_NPZ = False
     if IN_VCF:
         if IN_VCF[-4:].lower() == '.vcf' or IN_VCF[-7:].lower() == '.vcf.gz':
@@ -351,14 +363,14 @@ def main(raw_args=None):
                     my_chr = splt[0]
                     my_pos = int(splt[1])
                     my_filt = splt[6]
-                    if my_filt in ['PASS', 'NonSomatic']:
+                    if my_filt in VAR_FILTERS: # filters of interest: PASS / NonSomatic
                         fmt_split = splt[8].split(':')
                         dat_split = splt[9].split(':')
                         if 'GT' in fmt_split and 'AF' in fmt_split:
                             ind_gt = fmt_split.index('GT')
                             ind_af = fmt_split.index('AF')
                             my_gt = dat_split[ind_gt]
-                            my_af = float(dat_split[ind_af])
+                            my_af = float(dat_split[ind_af].split(',')[0]) # if multiallelic, take first
                             if my_gt == '1/1' or my_gt == '1|1' or my_af >= 0.950:
                                 pass
                             else:
@@ -370,11 +382,31 @@ def main(raw_args=None):
             f.close()
             sys.stdout.write(f' ({int(time.perf_counter() - tt)} sec)\n')
             sys.stdout.flush()
+            #
+            # compute variant density
+            #
+            for my_chr in sorted_chr:
+                my_dens = np.zeros((int(CONTIG_SIZES[my_chr]/VAR_WINDOW)+1), dtype='float')
+                if my_chr in in_variants:
+                    for vi in range(len(in_variants[my_chr][0])):
+                        my_vpos = int(in_variants[my_chr][0][vi]/VAR_WINDOW)
+                        my_dens[my_vpos] += 1.0
+                    var_dens_by_chr[my_chr] = np.array(my_dens, copy=True)
+                else:
+                    var_dens_by_chr[my_chr] = np.zeros((int(CONTIG_SIZES[my_chr]/VAR_WINDOW)+1), dtype='float')
         #
         elif IN_VCF[-4:].lower() == '.npz':
             print('reading from an existing npz archive instead of vcf...')
             in_npz = np.load(IN_VCF)
+            if in_npz['extra_covwin'] != WINDOW_SIZE:
+                print('Error: coverage window size in variant npz does not match.')
+                exit(1)
+            VAR_WINDOW = int(in_npz['extra_varwin'])
+            VAR_FILTERS = str(in_npz['var_filter']).split(',')
+            print(f' - ignoring -vw and instead using: {VAR_WINDOW}')
+            print(f' - ignoring -vf and instead using: {VAR_FILTERS}')
             var_kde_by_chr = {k:in_npz[k] for k in sorted_chr}
+            var_dens_by_chr = {k:in_npz[f'dens_{k}'] for k in sorted_chr}
             USING_VAR_NPZ = True
         #
         else:
@@ -385,8 +417,8 @@ def main(raw_args=None):
     # make VAF templates
     #
     VAF_TEMPLATES = {}
-    VAF_TEMPLATES['hom'] = get_template_vaf([0.100], WINDOW_SIZE, KDE_STD_VAF*1.0)
-    VAF_TEMPLATES['het'] = get_template_vaf([0.500], WINDOW_SIZE, KDE_STD_VAF*2.0)
+    VAF_TEMPLATES['1'] = get_template_vaf([0.080], WINDOW_SIZE, KDE_STD_VAF*1.5)
+    VAF_TEMPLATES['2'] = get_template_vaf([0.500], WINDOW_SIZE, KDE_STD_VAF*2.5)
     for copynum in range(3,6):
         for numer in range(1,int(copynum/2)+1):
             if numer*2 != copynum:
@@ -398,26 +430,30 @@ def main(raw_args=None):
     # -- in most cases this will correspond to 2 copies, but not always
     #
     all_win = []
+    masked_covdat_by_ref = {}
     for my_chr in sorted_chr:
         if my_chr in UNSTABLE_CHR:
+            masked_covdat_by_ref[my_chr] = covdat_by_ref[my_chr]
             continue
         cy = np.copy(covdat_by_ref[my_chr])
         if my_chr in unstable_by_chr:
             for ur in unstable_by_chr[my_chr]:
-                w1 = max(math.floor(ur[0]/WINDOW_SIZE), 0)
-                w2 = min(math.ceil(ur[1]/WINDOW_SIZE), len(cy)-1)
+                w1 = max(math.floor(ur[0]/WINDOW_SIZE) - BUFFER_UNSTABLE, 0)
+                w2 = min(math.ceil(ur[1]/WINDOW_SIZE) + BUFFER_UNSTABLE, len(cy)-1)
                 cy[w1:w2+1] = -1.0
+        masked_covdat_by_ref[my_chr] = np.copy(cy)
         all_win.extend(cy[cy >= 0.0].tolist())
     all_avg_cov = (np.mean(all_win), np.median(all_win), np.std(all_win))
     avg_log2 = np.log2(np.median(all_win))
     del all_win
 
     plotted_cx_cy = {}
+    cnv_bed_out = []
 
     #
     # plotting!
     #
-    fig_width_scalar = 11.5/CONTIG_SIZES['chr1']
+    fig_width_scalar = 11.5 / CONTIG_SIZES['chr1']
     fig_width_buffer = 0.5
     fig_width_min    = 2.0
     fig_height       = 5.0
@@ -428,10 +464,15 @@ def main(raw_args=None):
         #
         xt = np.arange(0,CONTIG_SIZES[my_chr],10000000)
         xl = [f'{n*10}M' for n in range(len(xt))]
-        with np.errstate(divide='ignore'):
-            cy = np.log2(covdat_by_ref[my_chr]) - avg_log2
+        with np.errstate(divide='ignore', invalid='ignore'):
+            #cy = np.log2(covdat_by_ref[my_chr]) - avg_log2
+            cy = np.log2(masked_covdat_by_ref[my_chr]) - avg_log2
         cx = np.array([n*WINDOW_SIZE + WINDOW_SIZE/2 for n in range(len(cy))])
         plotted_cx_cy[my_chr] = (np.copy(cx), np.copy(cy))
+        #
+        if my_chr in UNSTABLE_CHR:
+            print(f' skipping {my_chr}.')
+            continue
         #
         my_width = max(CONTIG_SIZES[my_chr]*fig_width_scalar + fig_width_buffer, fig_width_min)
         fig = mpl.figure(1, figsize=(my_width,fig_height), dpi=200)
@@ -456,12 +497,7 @@ def main(raw_args=None):
         else:
             Z = np.zeros((KDE_NUMPOINTS_VAF, int(CONTIG_SIZES[my_chr]/WINDOW_SIZE)+1), dtype='float')
             if my_chr in in_variants:
-                #(markerline, stemlines, baseline) = mpl.stem(in_variants[my_chr][0], in_variants[my_chr][1])
-                #mpl.setp(baseline, visible=False)
-                #mpl.setp(stemlines, visible=False)
-                #mpl.setp(markerline, markersize=1)
                 for vi in range(len(in_variants[my_chr][0])):
-                    #print(vi, '/', len(in_variants[my_chr][0]))
                     my_vpos = int(in_variants[my_chr][0][vi]/WINDOW_SIZE)
                     my_vvaf = int(in_variants[my_chr][1][vi]*KDE_NUMPOINTS_VAF)
                     my_std_pos = KDE_STD_POS/WINDOW_SIZE
@@ -481,31 +517,66 @@ def main(raw_args=None):
         # -- goes cytoband by cytoband --> sliding windows within each cytoband
         #
         if REPORT_COPYNUM:
-            if my_chr not in UNSTABLE_CHR:
-                for cdat in cyto_by_chr[my_chr]:
-                    my_type = cdat[3]
-                    if my_type not in UNSTABLE_REGION:
-                        xp = [int(cdat[0]/WINDOW_SIZE), int(cdat[1]/WINDOW_SIZE)+1]
+            cnv_bed_dat = []
+            for cdat in cyto_by_chr[my_chr]:
+                my_type = cdat[3]
+                if my_type not in UNSTABLE_REGION:
+                    cyto_xp = [int(cdat[0]/WINDOW_SIZE), int(cdat[1]/WINDOW_SIZE)+1]
+                    cnv_windows = [[n, n + CNV_NUM_INDS] for n in range(cyto_xp[0], cyto_xp[1], CNV_NUM_INDS) if n + CNV_NUM_INDS < cyto_xp[1]]
+                    if not cnv_windows:
+                        continue
+                    cnv_windows[-1][1] = cyto_xp[1] - 1
+                    #
+                    for xp in cnv_windows:
                         if np.sum(Z[:,xp[0]:xp[1]]) <= 0.0:
                             continue
                         avg_signal = np.mean(Z[:,xp[0]:xp[1]], axis=1)
+                        avg_coverage = np.median(plotted_cx_cy[my_chr][1][xp[0]:xp[1]])
                         my_sum = np.sum(avg_signal)
                         if my_sum > 0.0:
                             avg_signal /= my_sum
                             sorted_scores = []
+                            sorted_corrs = []
                             for template_name,vaf_template in VAF_TEMPLATES.items():
                                 my_dist = emd(vaf_template, avg_signal)
+                                my_corr = sum([vaf_template[n] * avg_signal[n] for n in range(len(vaf_template))])
                                 sorted_scores.append((my_dist, template_name))
-                                ####fig999 = mpl.figure(999)
-                                ####mpl.plot(np.arange(len(vaf_template)), vaf_template, '--r')
-                                ####mpl.plot(np.arange(len(avg_signal)), avg_signal, '-b')
-                                ####mpl.title(f'{my_chr}:{my_type}:{xp[0]}-{xp[1]} vs. {template_name}')
-                                ####mpl.legend([f'{my_dist:0.3f}'])
-                                ####mpl.savefig(f'{PLOT_DIR}{my_chr}_{my_type}_{xp[0]}-{xp[1]}_{template_name}.png')
-                                ####mpl.close(fig999)
+                                sorted_corrs.append((my_corr, template_name))
+                                ####if my_chr == 'chr1':
+                                ####    fig999 = mpl.figure(999)
+                                ####    mpl.plot(np.arange(len(vaf_template)), vaf_template, '--r')
+                                ####    mpl.plot(np.arange(len(avg_signal)), avg_signal, '-b')
+                                ####    mpl.title(f'{my_chr}:{my_type}:{xp[0]}-{xp[1]} vs. {template_name}')
+                                ####    mpl.legend([f'{my_dist:0.3f}'])
+                                ####    mpl.savefig(f'{PLOT_DIR}{my_chr}_{my_type}_{xp[0]}-{xp[1]}_{template_name}.png')
+                                ####    mpl.close(fig999)
                             sorted_scores = sorted(sorted_scores)
-                            print(sorted_scores[:3])
-                #Z = np.tile(vaf_template, (1,Z.shape[1]))
+                            sorted_corrs = sorted(sorted_corrs, reverse=True)
+                            cnv_pos_start = xp[0]*VAR_WINDOW
+                            cnv_pos_end = xp[1]*VAR_WINDOW
+                            cnv_assignment = int(sorted_corrs[0][1].split('-')[0])
+                            cnv_relative_likelihood = sorted_corrs[0][0] / sorted_corrs[1][0]
+                            #print(my_chr, xp, sorted_scores[:3])
+                            #print(f'{my_chr} : {cnv_pos_start:,} - {cnv_pos_end:,} [{cnv_assignment}] {cnv_relative_likelihood:.3f} {avg_coverage:.3f}')
+                            cnv_bed_dat.append((my_chr, cnv_pos_start, cnv_pos_end, cnv_assignment, cnv_relative_likelihood, avg_coverage))
+            #
+            cnv_windows = [[0, 1, cnv_bed_dat[0][3]]]
+            current_copynum = cnv_bed_dat[0][3]
+            for i,cbd in enumerate(cnv_bed_dat):
+                if i == 0:
+                    continue
+                current_copynum = cnv_bed_dat[i][3]
+                if current_copynum == cnv_windows[-1][2]:
+                    cnv_windows[-1][1] = i+1
+                else:
+                    cnv_windows.append([i, i+1, current_copynum])
+            for cw in cnv_windows:
+                avg_cnv_likelihood = np.mean([cnv_bed_dat[n][4] for n in range(cw[0], cw[1])])
+                avg_cnv_coverage = np.mean([cnv_bed_dat[n][5] for n in range(cw[0], cw[1])])
+                out_cnv_assignment = cw[2]
+                out_cnv_start = cnv_bed_dat[cw[0]][1]
+                out_cnv_end = cnv_bed_dat[cw[1]-1][2]
+                cnv_bed_out.append((my_chr, out_cnv_start, out_cnv_end, out_cnv_assignment, avg_cnv_likelihood, avg_cnv_coverage))
         #
         X, Y = np.meshgrid(range(0,len(Z[0])+1), range(0,len(Z)+1))
         mpl.pcolormesh(X,Y,Z)
@@ -543,6 +614,7 @@ def main(raw_args=None):
         mpl.yticks([],[])
         mpl.xlim(0,CONTIG_SIZES[my_chr])
         mpl.ylim(-1,1)
+        mpl.ylabel(my_chr)
         mpl.tight_layout()
         mpl.savefig(f'{PLOT_DIR}cov_{my_chr}.png')
         mpl.close(fig)
@@ -550,8 +622,17 @@ def main(raw_args=None):
         sys.stdout.write(f' ({int(time.perf_counter() - tt)} sec)\n')
         sys.stdout.flush()
 
+    #
+    # save parsed vcf data
+    #
     if USING_VAR_NPZ is False:
-        np.savez_compressed(VAF_NPZ, **var_kde_by_chr)
+        # append other variant data to the kde dict
+        var_kde_by_chr['extra_covwin'] = WINDOW_SIZE
+        var_kde_by_chr['extra_varwin'] = VAR_WINDOW
+        for my_chr in var_dens_by_chr.keys():
+            var_kde_by_chr[f'dens_{my_chr}'] = var_dens_by_chr[my_chr]
+        # save it all together in a single npz
+        np.savez_compressed(VAF_NPZ, var_filter=','.join(VAR_FILTERS), **var_kde_by_chr)
 
     #
     # whole genome plot
@@ -560,10 +641,11 @@ def main(raw_args=None):
     if SAMP_NAME:
         plot_fn = f'{PLOT_DIR}cov_wholegenome_{SAMP_NAME}.png'
     fig = mpl.figure(1, figsize=(30,10), dpi=200)
-    ax1 = mpl.subplot(211)
+    ax1 = mpl.subplot(311)
     current_x_offset = 0
     current_color_ind = 0
     concat_var_matrix = None
+    concat_var_dens = None
     chrom_xticks_major = [0]
     chrom_xlabels_major = ['']
     chrom_xticks_minor = []
@@ -574,8 +656,10 @@ def main(raw_args=None):
         Zvar = var_kde_by_chr[my_chr]
         if my_chr == sorted_chr[0]:
             concat_var_matrix = Zvar
+            concat_var_dens = var_dens_by_chr[my_chr]
         else:
             concat_var_matrix = np.concatenate((concat_var_matrix, Zvar), axis=1)
+            concat_var_dens = np.concatenate((concat_var_dens, var_dens_by_chr[my_chr]), axis=0)
         #
         if my_chr in unstable_by_chr:
             for ur in unstable_by_chr[my_chr]:
@@ -601,7 +685,7 @@ def main(raw_args=None):
         tick.tick1line.set_visible(False)
         tick.tick2line.set_visible(False)
     #
-    ax2 = mpl.subplot(212)
+    ax2 = mpl.subplot(312)
     Z = concat_var_matrix
     X, Y = np.meshgrid(range(0,len(Z[0])+1), range(0,len(Z)+1))
     mpl.pcolormesh(X,Y,Z)
@@ -614,9 +698,26 @@ def main(raw_args=None):
         tick.label1.set_visible(False)
         tick.label2.set_visible(False)
     #
+    ax3 = mpl.subplot(313)
+    mpl.plot([VAR_WINDOW*n for n in range(len(concat_var_dens))], concat_var_dens)
+    mpl.xlim(0,VAR_WINDOW*len(concat_var_dens))
+    mpl.ylim(bottom=0)
+    mpl.ylabel('variant density')
+    for tick in ax3.xaxis.get_major_ticks():
+        tick.tick1line.set_visible(False)
+        tick.tick2line.set_visible(False)
+        tick.label1.set_visible(False)
+        tick.label2.set_visible(False)
+    #
     mpl.tight_layout()
     mpl.savefig(plot_fn)
     mpl.close(fig)
+
+    if cnv_bed_out:
+        with open(CNV_BED, 'w') as f:
+            for n in cnv_bed_out:
+                if n[3] != 2: # don't report diploid
+                    f.write(f'{n[0]}\t{n[1]}\t{n[2]}\tcopy={n[3]}, score={n[4]:.2f}\n')
 
     print(f'average coverage: {all_avg_cov[0]:0.3f}')
     if len(all_bed_result):
