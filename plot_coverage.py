@@ -346,6 +346,8 @@ def main(raw_args=None):
     var_kde_by_chr = {}
     var_het_by_chr = {}
     var_hom_by_chr = {}
+    het_dens_by_chr = {}
+    hom_dens_by_chr = {}
     USING_VAR_NPZ = False
     if IN_VCF:
         if IN_VCF[-4:].lower() == '.vcf' or IN_VCF[-7:].lower() == '.vcf.gz':
@@ -429,21 +431,19 @@ def main(raw_args=None):
             print('Error: -v must be .vcf or .vcf.gz or .npz')
             exit(1)
 
-    #
-    # compute het/hom variant densities
-    #
-    het_dens_by_chr = {}
-    hom_dens_by_chr = {}
-    for my_chr in sorted_chr:
-        my_dens = np.zeros((int(CONTIG_SIZES[my_chr]/VAR_WINDOW)+1), dtype='float')
-        for my_vpos in var_het_by_chr[my_chr][0,:]:
-            my_dens[int(my_vpos)//VAR_WINDOW] += 1.0
-        het_dens_by_chr[my_chr] = np.array(my_dens, copy=True)
         #
-        my_dens = np.zeros((int(CONTIG_SIZES[my_chr]/VAR_WINDOW)+1), dtype='float')
-        for my_vpos in var_hom_by_chr[my_chr][0,:]:
-            my_dens[int(my_vpos)//VAR_WINDOW] += 1.0
-        hom_dens_by_chr[my_chr] = np.array(my_dens, copy=True)
+        # compute het/hom variant densities
+        #
+        for my_chr in sorted_chr:
+            my_dens = np.zeros((int(CONTIG_SIZES[my_chr]/VAR_WINDOW)+1), dtype='float')
+            for my_vpos in var_het_by_chr[my_chr][0,:]:
+                my_dens[int(my_vpos)//VAR_WINDOW] += 1.0
+            het_dens_by_chr[my_chr] = np.array(my_dens, copy=True)
+            #
+            my_dens = np.zeros((int(CONTIG_SIZES[my_chr]/VAR_WINDOW)+1), dtype='float')
+            for my_vpos in var_hom_by_chr[my_chr][0,:]:
+                my_dens[int(my_vpos)//VAR_WINDOW] += 1.0
+            hom_dens_by_chr[my_chr] = np.array(my_dens, copy=True)
 
     #
     # determine average coverage across whole genome
@@ -618,8 +618,8 @@ def main(raw_args=None):
                         my_hethom_ratio = len(my_window_hets) / len(my_window_homs)
                     bimodal_fit = fit_bimodal_gaussian(np.array(my_window_hets))
                     #print(bimodal_fit)
-                    norm_ll_component_ratio = (bimodal_fit['component1_log_likelihood'] - bimodal_fit['component2_log_likelihood']) / len(my_window_hets)
-                    print(my_chr, start_coords, end_coords, len(my_window_hets), f'{my_hethom_ratio:.3f}', f'{norm_ll_component_ratio:.3f}', f'{my_avg_cov:.3f}')
+                    norm_ll_component_ratio = abs((bimodal_fit['component1_log_likelihood'] - bimodal_fit['component2_log_likelihood']) / len(my_window_hets))
+                    print(my_chr, start_coords, end_coords, len(my_window_hets))
                     is_bimodal = bimodal_fit['single_gaussian_p-value'] < 0.05 and abs(norm_ll_component_ratio) < 10.0
                     # bimodal
                     if is_bimodal:
@@ -637,9 +637,12 @@ def main(raw_args=None):
                         my_var = np.var(my_window_hets)
                         my_norm_ll = bimodal_fit['single_gaussian_log_likelihood'] / len(my_window_hets)
                         # possibly many outliers, lets use median instead of mean
-                        if abs(norm_ll_component_ratio) > 10.0:
+                        if norm_ll_component_ratio > 10.0:
                             my_mean = np.median(my_window_hets)
                         print(f'-- Unimodal: u = {my_mean:.3f}, o^2 = {my_var:.3f}, nll = {my_norm_ll:.3f}')
+                    print(f'-- het/hom     = {my_hethom_ratio:.3f}')
+                    print(f'-- nll_1/nll_2 = {norm_ll_component_ratio:.3f}')
+                    print(f'-- cov         = {my_avg_cov:.3f}')
                     # example of appending to cnv_bed_dat:
                     # cnv_bed_dat.append((my_chr, start_coords, end_coords, cnv_assignment, cnv_likelihood, avg_coverage))
             exit(1)
@@ -671,7 +674,7 @@ def main(raw_args=None):
     #
     # save parsed vcf data
     #
-    if USING_VAR_NPZ is False:
+    if IN_VCF and USING_VAR_NPZ is False:
         var_npz_outdict = {}
         var_npz_outdict['extra_covwin'] = WINDOW_SIZE
         var_npz_outdict['extra_varwin'] = VAR_WINDOW
@@ -692,12 +695,15 @@ def main(raw_args=None):
     if SAMP_NAME:
         plot_fn = f'{PLOT_DIR}cov_wholegenome_{SAMP_NAME}.png'
     fig = mpl.figure(1, figsize=(30,10), dpi=200)
-    ax1 = mpl.subplot(311)
+    gs = gridspec.GridSpec(4, 1, height_ratios=[4,4,4,1])
+    #
+    ax1 = mpl.subplot(gs[0])
     current_x_offset = 0
     current_color_ind = 0
     concat_var_matrix = None
     concat_het_dens = None
     concat_hom_dens = None
+    bed_region_polygons = []
     chrom_xticks_major = [0]
     chrom_xlabels_major = ['']
     chrom_xticks_minor = []
@@ -705,18 +711,34 @@ def main(raw_args=None):
     for my_chr in sorted_chr:
         my_color = CHROM_COLOR_CYCLE[current_color_ind % len(CHROM_COLOR_CYCLE)]
         (cx, cy) = plotted_cx_cy[my_chr]
+        #
         if my_chr in var_kde_by_chr:
             Zvar = var_kde_by_chr[my_chr]
         else:
             Zvar = np.zeros((KDE_NUMPOINTS_VAF, int(CONTIG_SIZES[my_chr]/WINDOW_SIZE)+1), dtype='float')
+        if my_chr in het_dens_by_chr:
+            next_het_dens = het_dens_by_chr[my_chr]
+        else:
+            next_het_dens = np.zeros((int(CONTIG_SIZES[my_chr]/VAR_WINDOW)+1), dtype='float')
+        if my_chr in hom_dens_by_chr:
+            next_hom_dens = hom_dens_by_chr[my_chr]
+        else:
+            next_hom_dens = np.zeros((int(CONTIG_SIZES[my_chr]/VAR_WINDOW)+1), dtype='float')
+        #
         if my_chr == sorted_chr[0]:
             concat_var_matrix = Zvar
-            concat_het_dens = het_dens_by_chr[my_chr]
-            concat_hom_dens = hom_dens_by_chr[my_chr]
+            concat_het_dens = next_het_dens
+            concat_hom_dens = next_hom_dens
         else:
             concat_var_matrix = np.concatenate((concat_var_matrix, Zvar), axis=1)
-            concat_het_dens = np.concatenate((concat_het_dens, het_dens_by_chr[my_chr]), axis=0)
-            concat_hom_dens = np.concatenate((concat_hom_dens, hom_dens_by_chr[my_chr]), axis=0)
+            concat_het_dens = np.concatenate((concat_het_dens, next_het_dens), axis=0)
+            concat_hom_dens = np.concatenate((concat_hom_dens, next_hom_dens), axis=0)
+        #
+        if my_chr in bed_regions:
+            for (bed_start, bed_end, bed_annot) in bed_regions[my_chr]:
+                xp = [bed_start + current_x_offset, bed_end + current_x_offset]
+                yp = [-1, 1]
+                bed_region_polygons.append(Polygon(np.array([[xp[0],yp[0]], [xp[0],yp[1]], [xp[1],yp[1]], [xp[1],yp[0]]]), closed=True))
         #
         if my_chr in unstable_by_chr:
             for ur in unstable_by_chr[my_chr]:
@@ -742,7 +764,7 @@ def main(raw_args=None):
         tick.tick1line.set_visible(False)
         tick.tick2line.set_visible(False)
     #
-    ax2 = mpl.subplot(312)
+    ax2 = mpl.subplot(gs[1])
     Z = concat_var_matrix
     X, Y = np.meshgrid(range(0,len(Z[0])+1), range(0,len(Z)+1))
     mpl.pcolormesh(X,Y,Z)
@@ -755,13 +777,27 @@ def main(raw_args=None):
         tick.label1.set_visible(False)
         tick.label2.set_visible(False)
     #
-    ax3 = mpl.subplot(313)
+    ax3 = mpl.subplot(gs[2])
     mpl.plot([VAR_WINDOW*n for n in range(len(concat_het_dens))], concat_het_dens, color='blue', alpha=0.5)
     mpl.plot([VAR_WINDOW*n for n in range(len(concat_hom_dens))], concat_hom_dens, color='red', alpha=0.5)
     mpl.xlim(0,VAR_WINDOW*len(concat_het_dens))
     mpl.ylim(bottom=0)
     mpl.ylabel('variant density')
+    ax3.xaxis.get_major_formatter().set_scientific(False)
     for tick in ax3.xaxis.get_major_ticks():
+        tick.tick1line.set_visible(False)
+        tick.tick2line.set_visible(False)
+        tick.label1.set_visible(False)
+        tick.label2.set_visible(False)
+    #
+    ax4 = mpl.subplot(gs[3])
+    for bed_poly in bed_region_polygons:
+        ax4.add_collection(PatchCollection([bed_poly], color='green', alpha=0.8, linewidth=0))
+    mpl.yticks([],[])
+    mpl.xlim([0,current_x_offset])
+    mpl.ylim([-1,1])
+    ax4.xaxis.get_major_formatter().set_scientific(False)
+    for tick in ax4.xaxis.get_major_ticks():
         tick.tick1line.set_visible(False)
         tick.tick2line.set_visible(False)
         tick.label1.set_visible(False)
