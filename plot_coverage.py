@@ -124,16 +124,6 @@ def find_indices_in_range(sorted_list, lb, ub):
     return (start_idx, end_idx)
 
 
-def get_template_vaf(vaf_list, WINDOW_SIZE, vaf_std):
-    template = np.zeros((KDE_NUMPOINTS_VAF), dtype='float')
-    my_std_pos = KDE_STD_POS/WINDOW_SIZE
-    for my_vvaf in vaf_list:
-        for zx in range(template.shape[0]):
-            template[zx] += np.exp(log_px(zx, 0, int(my_vvaf*KDE_NUMPOINTS_VAF), 0, vaf_std, my_std_pos))
-    template /= np.sum(template)
-    return template
-
-
 def emd(pdf_a, pdf_b):
     return wasserstein_distance(np.arange(len(pdf_a)), np.arange(len(pdf_b)), pdf_a, pdf_b)
 
@@ -456,18 +446,6 @@ def main(raw_args=None):
         hom_dens_by_chr[my_chr] = np.array(my_dens, copy=True)
 
     #
-    # make VAF templates
-    #
-    VAF_TEMPLATES = {}
-    VAF_TEMPLATES['1'] = get_template_vaf([0.080], WINDOW_SIZE, KDE_STD_VAF*1.5)
-    VAF_TEMPLATES['2'] = get_template_vaf([0.500], WINDOW_SIZE, KDE_STD_VAF*2.5)
-    for copynum in range(3,6):
-        for numer in range(1,int(copynum/2)+1):
-            if numer*2 != copynum:
-                my_vaf = numer/copynum
-                VAF_TEMPLATES[f'{copynum}-{numer}'] = get_template_vaf([my_vaf, 1.0-my_vaf], WINDOW_SIZE, KDE_STD_VAF*1.0)
-
-    #
     # determine average coverage across whole genome
     # -- in most cases this will correspond to 2 copies, but not always
     #
@@ -487,18 +465,32 @@ def main(raw_args=None):
         all_win.extend(cy[cy >= 0.0].tolist())
     all_avg_cov = (np.mean(all_win), np.median(all_win), np.std(all_win))
     avg_log2 = np.log2(np.median(all_win))
+    #
+    fig = mpl.figure(1, figsize=(10,5))
+    with np.errstate(divide='ignore', invalid='ignore'):
+        mpl.hist(np.log2(all_win) - avg_log2, bins=300, range=[COV_YT[0], COV_YT[-1]])
+    mpl.xticks(COV_YT, COV_YL)
+    mpl.xlim([COV_YT[0], COV_YT[-1]])
+    mpl.grid(which='both', linestyle='--', alpha=0.6)
+    mpl.xlabel('normalized log2 depth')
+    mpl.ylabel('bin count')
+    mpl.tight_layout()
+    mpl.savefig(f'{PLOT_DIR}depth-hist.png')
+    mpl.close(fig)
     del all_win
 
-    plotted_cx_cy = {}
-    cnv_bed_out = []
+    #
+    #
+    #
 
-    #
-    # plotting!
-    #
     fig_width_scalar = 11.5 / CONTIG_SIZES['chr1']
     fig_width_buffer = 0.5
     fig_width_min    = 2.0
     fig_height       = 5.0
+    #
+    plotted_cx_cy = {}
+    cnv_bed_out = []
+
     for my_chr in sorted_chr:
         sys.stdout.write(f'making plots for {my_chr}...')
         sys.stdout.flush()
@@ -517,6 +509,9 @@ def main(raw_args=None):
             Z = np.zeros((KDE_NUMPOINTS_VAF, int(CONTIG_SIZES[my_chr]/WINDOW_SIZE)+1), dtype='float')
             var_kde_by_chr[my_chr] = np.array(Z, copy=True)
             continue
+
+        #
+        # PLOTTING
         #
         my_width = max(CONTIG_SIZES[my_chr]*fig_width_scalar + fig_width_buffer, fig_width_min)
         fig = mpl.figure(1, figsize=(my_width,fig_height), dpi=200)
@@ -554,116 +549,7 @@ def main(raw_args=None):
                     my_sum = np.sum(Z[:,zy])
                     if my_sum > 0.0:
                         Z[:,zy] /= my_sum
-            #Z = np.array(Z[::-1])
             var_kde_by_chr[my_chr] = np.array(Z, copy=True)
-        #
-        # gaussian fit CNV calling
-        #
-        if REPORT_COPYNUM:
-            sorted_het_coords = [int(n) for n in var_het_by_chr[my_chr][0,:]]
-            sorted_het_vafs = [float(n) for n in var_het_by_chr[my_chr][1,:]]
-            sorted_hom_coords = [int(n) for n in var_hom_by_chr[my_chr][0,:]]
-            sorted_hom_vafs = [float(n) for n in var_hom_by_chr[my_chr][1,:]]
-            for vi in range(0, CONTIG_SIZES[my_chr], CNV_NUM_INDS * WINDOW_SIZE):
-                (v_lb, v_ub) = find_indices_in_range(sorted_het_coords, vi, vi + CNV_NUM_INDS * WINDOW_SIZE)
-                my_window_hets = sorted_het_vafs[v_lb:v_ub]
-                (v_lb_hom, v_ub_hom) = find_indices_in_range(sorted_hom_coords, vi, vi + CNV_NUM_INDS * WINDOW_SIZE)
-                my_window_homs = sorted_hom_vafs[v_lb_hom:v_ub_hom]
-                if len(my_window_hets) >= CNV_MINVAR:
-                    my_hethom_ratio = None
-                    if len(my_window_homs):
-                        my_hethom_ratio = len(my_window_hets) / len(my_window_homs)
-                    bimodal_fit = fit_bimodal_gaussian(np.array(my_window_hets))
-                    #print(bimodal_fit)
-                    norm_ll_component_ratio = (bimodal_fit['component1_log_likelihood'] - bimodal_fit['component2_log_likelihood']) / len(my_window_hets)
-                    print(my_chr, vi, vi + CNV_NUM_INDS * WINDOW_SIZE, len(my_window_hets), f'{my_hethom_ratio:.3f}', f'{norm_ll_component_ratio:.3f}')
-                    is_bimodal = bimodal_fit['single_gaussian_p-value'] < 0.05 and abs(norm_ll_component_ratio) < 10.0
-                    # bimodal
-                    if is_bimodal:
-                        #plot_fn = f'{PLOT_DIR}bimodal_{my_chr}_{vi}_{vi + CNV_NUM_INDS * WINDOW_SIZE}.png'
-                        #plot_title = f'{my_chr}:{vi}-{vi + CNV_NUM_INDS * WINDOW_SIZE}'
-                        #plot_bimodal_fit(np.array(my_window_hets), bimodal_fit['A'], bimodal_fit['B'], plot_fn, plot_title=plot_title)
-                        my_mean1 = 0.5 - bimodal_fit['A']
-                        my_mean2 = 0.5 + bimodal_fit['A']
-                        my_var = bimodal_fit['B']
-                        my_norm_ll = bimodal_fit['max_log_likelihood'] / len(my_window_hets)
-                        print(f'-- Bimodal: u1 = {my_mean1:.3f}, u2 = {my_mean2:.3f}, o^2 = {my_var:.3f}, nll = {my_norm_ll:.3f}')
-                    # unimodal
-                    else:
-                        my_mean = np.mean(my_window_hets)
-                        my_var = np.var(my_window_hets)
-                        my_norm_ll = bimodal_fit['single_gaussian_log_likelihood'] / len(my_window_hets)
-                        # possibly many outliers, lets use median instead of mean
-                        if abs(norm_ll_component_ratio) > 10.0:
-                            my_mean = np.median(my_window_hets)
-                        print(f'-- Unimodal: u = {my_mean:.3f}, o^2 = {my_var:.3f}, nll = {my_norm_ll:.3f}')
-            exit(1)
-        #
-        # EXPERIMENTAL FEATURE: VAF template detection
-        # -- goes cytoband by cytoband --> sliding windows within each cytoband
-        #
-        if REPORT_COPYNUM:
-            cnv_bed_dat = []
-            for cdat in cyto_by_chr[my_chr]:
-                my_type = cdat[3]
-                if my_type not in UNSTABLE_REGION:
-                    cyto_xp = [int(cdat[0]/WINDOW_SIZE), int(cdat[1]/WINDOW_SIZE)+1]
-                    cnv_windows = [[n, n + CNV_NUM_INDS] for n in range(cyto_xp[0], cyto_xp[1], CNV_NUM_INDS) if n + CNV_NUM_INDS < cyto_xp[1]]
-                    if not cnv_windows:
-                        continue
-                    cnv_windows[-1][1] = cyto_xp[1] - 1
-                    #
-                    for xp in cnv_windows:
-                        if np.sum(Z[:,xp[0]:xp[1]]) <= 0.0:
-                            continue
-                        avg_signal = np.mean(Z[:,xp[0]:xp[1]], axis=1)
-                        avg_coverage = np.median(plotted_cx_cy[my_chr][1][xp[0]:xp[1]])
-                        my_sum = np.sum(avg_signal)
-                        if my_sum > 0.0:
-                            avg_signal /= my_sum
-                            sorted_scores = []
-                            sorted_corrs = []
-                            for template_name,vaf_template in VAF_TEMPLATES.items():
-                                my_dist = emd(vaf_template, avg_signal)
-                                my_corr = sum([vaf_template[n] * avg_signal[n] for n in range(len(vaf_template))])
-                                sorted_scores.append((my_dist, template_name))
-                                sorted_corrs.append((my_corr, template_name))
-                                ####if my_chr == 'chr1':
-                                ####    fig999 = mpl.figure(999)
-                                ####    mpl.plot(np.arange(len(vaf_template)), vaf_template, '--r')
-                                ####    mpl.plot(np.arange(len(avg_signal)), avg_signal, '-b')
-                                ####    mpl.title(f'{my_chr}:{my_type}:{xp[0]}-{xp[1]} vs. {template_name}')
-                                ####    mpl.legend([f'{my_dist:0.3f}'])
-                                ####    mpl.savefig(f'{PLOT_DIR}{my_chr}_{my_type}_{xp[0]}-{xp[1]}_{template_name}.png')
-                                ####    mpl.close(fig999)
-                            sorted_scores = sorted(sorted_scores)
-                            sorted_corrs = sorted(sorted_corrs, reverse=True)
-                            cnv_pos_start = xp[0]*VAR_WINDOW
-                            cnv_pos_end = xp[1]*VAR_WINDOW
-                            cnv_assignment = int(sorted_corrs[0][1].split('-')[0])
-                            cnv_relative_likelihood = sorted_corrs[0][0] / sorted_corrs[1][0]
-                            #print(my_chr, xp, sorted_scores[:3])
-                            #print(f'{my_chr} : {cnv_pos_start:,} - {cnv_pos_end:,} [{cnv_assignment}] {cnv_relative_likelihood:.3f} {avg_coverage:.3f}')
-                            cnv_bed_dat.append((my_chr, cnv_pos_start, cnv_pos_end, cnv_assignment, cnv_relative_likelihood, avg_coverage))
-            #
-            if cnv_bed_dat:
-                cnv_windows = [[0, 1, cnv_bed_dat[0][3]]]
-                current_copynum = cnv_bed_dat[0][3]
-                for i,cbd in enumerate(cnv_bed_dat):
-                    if i == 0:
-                        continue
-                    current_copynum = cnv_bed_dat[i][3]
-                    if current_copynum == cnv_windows[-1][2]:
-                        cnv_windows[-1][1] = i+1
-                    else:
-                        cnv_windows.append([i, i+1, current_copynum])
-                for cw in cnv_windows:
-                    avg_cnv_likelihood = np.mean([cnv_bed_dat[n][4] for n in range(cw[0], cw[1])])
-                    avg_cnv_coverage = np.mean([cnv_bed_dat[n][5] for n in range(cw[0], cw[1])])
-                    out_cnv_assignment = cw[2]
-                    out_cnv_start = cnv_bed_dat[cw[0]][1]
-                    out_cnv_end = cnv_bed_dat[cw[1]-1][2]
-                    cnv_bed_out.append((my_chr, out_cnv_start, out_cnv_end, out_cnv_assignment, avg_cnv_likelihood, avg_cnv_coverage))
         #
         X, Y = np.meshgrid(range(0,len(Z[0])+1), range(0,len(Z)+1))
         mpl.pcolormesh(X,Y,Z)
@@ -705,7 +591,80 @@ def main(raw_args=None):
         mpl.tight_layout()
         mpl.savefig(f'{PLOT_DIR}cov_{my_chr}.png')
         mpl.close(fig)
+
         #
+        # EXPERIMENTAL FEATURE: bimodal gaussian fit --> CNV calling
+        #
+        if REPORT_COPYNUM:
+            sorted_het_coords = [int(n) for n in var_het_by_chr[my_chr][0,:]]
+            sorted_het_vafs = [float(n) for n in var_het_by_chr[my_chr][1,:]]
+            sorted_hom_coords = [int(n) for n in var_hom_by_chr[my_chr][0,:]]
+            sorted_hom_vafs = [float(n) for n in var_hom_by_chr[my_chr][1,:]]
+            cnv_bed_dat = []
+            for vi in range(0, CONTIG_SIZES[my_chr], CNV_NUM_INDS * WINDOW_SIZE):
+                start_coords = vi
+                end_coords = vi + CNV_NUM_INDS * WINDOW_SIZE
+                #
+                my_cov_vector = plotted_cx_cy[my_chr][1][start_coords//WINDOW_SIZE:end_coords//WINDOW_SIZE]
+                my_avg_cov = np.median(my_cov_vector)
+                #
+                (v_lb, v_ub) = find_indices_in_range(sorted_het_coords, start_coords, end_coords)
+                my_window_hets = sorted_het_vafs[v_lb:v_ub]
+                (v_lb_hom, v_ub_hom) = find_indices_in_range(sorted_hom_coords, start_coords, end_coords)
+                my_window_homs = sorted_hom_vafs[v_lb_hom:v_ub_hom]
+                if len(my_window_hets) >= CNV_MINVAR:
+                    my_hethom_ratio = None
+                    if len(my_window_homs):
+                        my_hethom_ratio = len(my_window_hets) / len(my_window_homs)
+                    bimodal_fit = fit_bimodal_gaussian(np.array(my_window_hets))
+                    #print(bimodal_fit)
+                    norm_ll_component_ratio = (bimodal_fit['component1_log_likelihood'] - bimodal_fit['component2_log_likelihood']) / len(my_window_hets)
+                    print(my_chr, start_coords, end_coords, len(my_window_hets), f'{my_hethom_ratio:.3f}', f'{norm_ll_component_ratio:.3f}', f'{my_avg_cov:.3f}')
+                    is_bimodal = bimodal_fit['single_gaussian_p-value'] < 0.05 and abs(norm_ll_component_ratio) < 10.0
+                    # bimodal
+                    if is_bimodal:
+                        #plot_fn = f'{PLOT_DIR}bimodal_{my_chr}_{start_coords}_{end_coords}.png'
+                        #plot_title = f'{my_chr}:{start_coords}-{end_coords}'
+                        #plot_bimodal_fit(np.array(my_window_hets), bimodal_fit['A'], bimodal_fit['B'], plot_fn, plot_title=plot_title)
+                        my_mean1 = 0.5 - bimodal_fit['A']
+                        my_mean2 = 0.5 + bimodal_fit['A']
+                        my_var = bimodal_fit['B']
+                        my_norm_ll = bimodal_fit['max_log_likelihood'] / len(my_window_hets)
+                        print(f'-- Bimodal: u1 = {my_mean1:.3f}, u2 = {my_mean2:.3f}, o^2 = {my_var:.3f}, nll = {my_norm_ll:.3f}')
+                    # unimodal
+                    else:
+                        my_mean = np.mean(my_window_hets)
+                        my_var = np.var(my_window_hets)
+                        my_norm_ll = bimodal_fit['single_gaussian_log_likelihood'] / len(my_window_hets)
+                        # possibly many outliers, lets use median instead of mean
+                        if abs(norm_ll_component_ratio) > 10.0:
+                            my_mean = np.median(my_window_hets)
+                        print(f'-- Unimodal: u = {my_mean:.3f}, o^2 = {my_var:.3f}, nll = {my_norm_ll:.3f}')
+                    # example of appending to cnv_bed_dat:
+                    # cnv_bed_dat.append((my_chr, start_coords, end_coords, cnv_assignment, cnv_likelihood, avg_coverage))
+            exit(1)
+            #
+            # merge windows into larger CNV calls
+            #
+            if cnv_bed_dat:
+                cnv_windows = [[0, 1, cnv_bed_dat[0][3]]]
+                current_copynum = cnv_bed_dat[0][3]
+                for i,cbd in enumerate(cnv_bed_dat):
+                    if i == 0:
+                        continue
+                    current_copynum = cnv_bed_dat[i][3]
+                    if current_copynum == cnv_windows[-1][2]:
+                        cnv_windows[-1][1] = i+1
+                    else:
+                        cnv_windows.append([i, i+1, current_copynum])
+                for cw in cnv_windows:
+                    avg_cnv_likelihood = np.mean([cnv_bed_dat[n][4] for n in range(cw[0], cw[1])])
+                    avg_cnv_coverage = np.mean([cnv_bed_dat[n][5] for n in range(cw[0], cw[1])])
+                    out_cnv_assignment = cw[2]
+                    out_cnv_start = cnv_bed_dat[cw[0]][1]
+                    out_cnv_end = cnv_bed_dat[cw[1]-1][2]
+                    cnv_bed_out.append((my_chr, out_cnv_start, out_cnv_end, out_cnv_assignment, avg_cnv_likelihood, avg_cnv_coverage))
+
         sys.stdout.write(f' ({int(time.perf_counter() - tt)} sec)\n')
         sys.stdout.flush()
 
